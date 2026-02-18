@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import Sidebar from "./components/Sidebar";
 import OfficeView from "./components/OfficeView";
 import { ChatPanel } from "./components/ChatPanel";
@@ -51,6 +51,7 @@ export interface CeoOfficeCall {
   phase: "kickoff" | "review";
   action?: "arrive" | "speak" | "dismiss";
   line?: string;
+  taskId?: string;
   instant?: boolean;
   holdUntil?: number;
 }
@@ -273,20 +274,25 @@ export default function App() {
           phase?: "kickoff" | "review";
           action?: "arrive" | "speak" | "dismiss";
           line?: string;
+          task_id?: string;
           hold_until?: number;
         };
         if (!p.from_agent_id) return;
         const action = p.action ?? "arrive";
-        if (action === "arrive") {
-          const holdUntil = p.hold_until ?? (Date.now() + 600_000);
+        if (action === "arrive" || action === "speak") {
           setMeetingPresence((prev) => {
+            const existing = prev.find((row) => row.agent_id === p.from_agent_id);
             const rest = prev.filter((row) => row.agent_id !== p.from_agent_id);
+            const holdUntil = action === "arrive"
+              ? (p.hold_until ?? existing?.until ?? (Date.now() + 600_000))
+              : (existing?.until ?? (Date.now() + 600_000));
             return [
               ...rest,
               {
                 agent_id: p.from_agent_id,
-                seat_index: p.seat_index ?? 0,
-                phase: p.phase ?? "kickoff",
+                seat_index: p.seat_index ?? existing?.seat_index ?? 0,
+                phase: p.phase ?? existing?.phase ?? "kickoff",
+                task_id: p.task_id ?? existing?.task_id ?? null,
                 until: holdUntil,
               },
             ];
@@ -303,6 +309,7 @@ export default function App() {
             phase: p.phase ?? "kickoff",
             action,
             line: p.line,
+            taskId: p.task_id,
             holdUntil: p.hold_until,
             instant: action === "arrive" && viewRef.current !== "office",
           },
@@ -375,6 +382,24 @@ export default function App() {
     }, 5000);
     return () => clearInterval(timer);
   }, []);
+
+  const activeMeetingTaskId = useMemo(() => {
+    const now = Date.now();
+    const counts = new Map<string, number>();
+    for (const row of meetingPresence) {
+      if (row.until < now || !row.task_id) continue;
+      counts.set(row.task_id, (counts.get(row.task_id) ?? 0) + 1);
+    }
+    let picked: string | null = null;
+    let maxCount = -1;
+    for (const [taskId, count] of counts.entries()) {
+      if (count > maxCount) {
+        maxCount = count;
+        picked = taskId;
+      }
+    }
+    return picked;
+  }, [meetingPresence]);
 
   // Handlers
   async function handleSendMessage(
@@ -666,6 +691,7 @@ export default function App() {
                 tasks={tasks}
                 subAgents={subAgents}
                 meetingPresence={meetingPresence}
+                activeMeetingTaskId={activeMeetingTaskId}
                 unreadAgentIds={unreadAgentIds}
                 crossDeptDeliveries={crossDeptDeliveries}
                 onCrossDeptDeliveryProcessed={(id) =>
@@ -674,6 +700,9 @@ export default function App() {
                 ceoOfficeCalls={ceoOfficeCalls}
                 onCeoOfficeCallProcessed={(id) =>
                   setCeoOfficeCalls((prev) => prev.filter((d) => d.id !== id))
+                }
+                onOpenActiveMeetingMinutes={(taskId) =>
+                  setTaskPanel({ taskId, tab: "minutes" })
                 }
                 onSelectAgent={(a) => setSelectedAgent(a)}
                 onSelectDepartment={(dept) => {

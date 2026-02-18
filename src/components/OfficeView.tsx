@@ -48,11 +48,13 @@ interface OfficeViewProps {
   tasks: Task[];
   subAgents: SubAgent[];
   meetingPresence?: MeetingPresence[];
+  activeMeetingTaskId?: string | null;
   unreadAgentIds?: Set<string>;
   crossDeptDeliveries?: CrossDeptDelivery[];
   onCrossDeptDeliveryProcessed?: (id: string) => void;
   ceoOfficeCalls?: CeoOfficeCall[];
   onCeoOfficeCallProcessed?: (id: string) => void;
+  onOpenActiveMeetingMinutes?: (taskId: string) => void;
   onSelectAgent: (agent: Agent) => void;
   onSelectDepartment: (dept: Department) => void;
 }
@@ -232,6 +234,12 @@ const LOCALE_TEXT = {
       "正在共享修改思路",
       "正在交叉评审交付物",
     ],
+  },
+  meetingTableHint: {
+    ko: "📝 회의 중: 테이블 클릭해 회의록 보기",
+    en: "📝 Meeting live: click table for minutes",
+    ja: "📝 会議中: テーブルをクリックして会議録を見る",
+    zh: "📝 会议进行中：点击桌子查看纪要",
   },
   cliUsageTitle: {
     ko: "CLI 사용량",
@@ -585,11 +593,14 @@ function formatTaskCount(count: number, locale: SupportedLocale): string {
 
 export default function OfficeView({
   departments, agents, tasks, subAgents,
+  meetingPresence,
+  activeMeetingTaskId,
   unreadAgentIds,
   crossDeptDeliveries,
   onCrossDeptDeliveryProcessed,
   ceoOfficeCalls,
   onCeoOfficeCallProcessed,
+  onOpenActiveMeetingMinutes,
   onSelectAgent, onSelectDepartment,
 }: OfficeViewProps) {
   const { language, t } = useI18n();
@@ -598,6 +609,7 @@ export default function OfficeView({
   const texturesRef = useRef<Record<string, Texture>>({});
   const destroyedRef = useRef(false);
   const initDoneRef = useRef(false);
+  const [sceneRevision, setSceneRevision] = useState(0);
 
   // Animation state refs
   const tickRef = useRef(0);
@@ -634,10 +646,14 @@ export default function OfficeView({
   localeRef.current = language;
 
   // Latest data via refs (avoids stale closures)
-  const dataRef = useRef({ departments, agents, tasks, subAgents, unreadAgentIds });
-  dataRef.current = { departments, agents, tasks, subAgents, unreadAgentIds };
+  const dataRef = useRef({ departments, agents, tasks, subAgents, unreadAgentIds, meetingPresence });
+  dataRef.current = { departments, agents, tasks, subAgents, unreadAgentIds, meetingPresence };
   const cbRef = useRef({ onSelectAgent, onSelectDepartment });
   cbRef.current = { onSelectAgent, onSelectDepartment };
+  const activeMeetingTaskIdRef = useRef<string | null>(activeMeetingTaskId ?? null);
+  activeMeetingTaskIdRef.current = activeMeetingTaskId ?? null;
+  const meetingMinutesOpenRef = useRef<typeof onOpenActiveMeetingMinutes>(onOpenActiveMeetingMinutes);
+  meetingMinutesOpenRef.current = onOpenActiveMeetingMinutes;
 
   /* ── BUILD SCENE (no app destroy, just stage clear + rebuild) ── */
   const buildScene = useCallback(() => {
@@ -744,6 +760,15 @@ export default function OfficeView({
     mt.roundRect(mtX, mtY, mtW, mtH, 12).fill(0x6f4f1e);
     mt.roundRect(mtX + 3, mtY + 3, mtW - 6, mtH - 6, 10).fill(0x9d7440);
     mt.roundRect(mtX + 64, mtY + 8, 92, 12, 5).fill({ color: 0xf7d89a, alpha: 0.35 });
+    if (activeMeetingTaskIdRef.current && meetingMinutesOpenRef.current) {
+      mt.eventMode = "static";
+      mt.cursor = "pointer";
+      mt.on("pointerdown", () => {
+        const taskId = activeMeetingTaskIdRef.current;
+        if (!taskId) return;
+        meetingMinutesOpenRef.current?.(taskId);
+      });
+    }
     ceoLayer.addChild(mt);
 
     const meetingSeatX = [mtX + 40, mtX + 110, mtX + 180];
@@ -843,6 +868,20 @@ export default function OfficeView({
     // Keep the control hint inside the CEO OFFICE area (bottom-right corner).
     hint.position.set(OFFICE_W - 16, CEO_ZONE_H - 8);
     ceoLayer.addChild(hint);
+    if (activeMeetingTaskIdRef.current) {
+      const meetingHint = new Text({
+        text: pickLocale(activeLocale, LOCALE_TEXT.meetingTableHint),
+        style: new TextStyle({
+          fontSize: 12,
+          fill: 0xffe7a5,
+          fontWeight: "bold",
+          fontFamily: "system-ui, sans-serif",
+        }),
+      });
+      meetingHint.anchor.set(1, 1);
+      meetingHint.position.set(hint.position.x - hint.width - 18, hint.position.y);
+      ceoLayer.addChild(meetingHint);
+    }
 
     drawPlant(ceoLayer, 18, 62);
     drawPlant(ceoLayer, OFFICE_W - 22, 62);
@@ -1394,6 +1433,7 @@ export default function OfficeView({
         });
       }
     }
+    setSceneRevision((prev) => prev + 1);
   }, []);
 
   /* ── INIT PIXI APP (runs once on mount) ── */
@@ -1505,7 +1545,11 @@ export default function OfficeView({
         for (const { sprite, status, baseX, baseY, particles, agentId, cliProvider, deskG, bedG, blanketG } of animItemsRef.current) {
           // Hide desk sprite if agent is at CEO meeting table
           if (agentId) {
-            const inMeeting = deliveriesRef.current.some(
+            const meetingNow = Date.now();
+            const inMeetingPresence = (dataRef.current.meetingPresence ?? []).some(
+              row => row.agent_id === agentId && row.until >= meetingNow,
+            );
+            const inMeeting = inMeetingPresence || deliveriesRef.current.some(
               d => d.agentId === agentId && d.holdAtSeat && d.arrived,
             );
             sprite.visible = !inMeeting;
@@ -1847,7 +1891,102 @@ export default function OfficeView({
     if (initDoneRef.current && appRef.current) {
       buildScene();
     }
-  }, [departments, agents, tasks, subAgents, unreadAgentIds, language, buildScene]);
+  }, [departments, agents, tasks, subAgents, unreadAgentIds, language, activeMeetingTaskId, buildScene]);
+
+  /* ── MEETING PRESENCE SYNC (restore seats on refresh/view switch) ── */
+  useEffect(() => {
+    const dlLayer = deliveryLayerRef.current;
+    const textures = texturesRef.current;
+    const seats = ceoMeetingSeatsRef.current;
+    if (!dlLayer || seats.length === 0) return;
+
+    const now = Date.now();
+    const rows = (meetingPresence ?? []).filter((row) => row.until >= now);
+    const activeByAgent = new Map(rows.map((row) => [row.agent_id, row]));
+
+    for (const row of rows) {
+      const seat = seats[row.seat_index % seats.length];
+      if (!seat) continue;
+
+      const existing = deliveriesRef.current.find(
+        (d) => d.agentId === row.agent_id && d.holdAtSeat,
+      );
+      if (existing) {
+        existing.meetingSeatIndex = row.seat_index;
+        existing.holdUntil = row.until;
+        existing.toX = seat.x;
+        existing.toY = seat.y;
+        existing.arrived = true;
+        existing.progress = 1;
+        existing.seatedPoseApplied = false;
+        existing.sprite.position.set(seat.x, seat.y);
+        existing.sprite.alpha = 1;
+        continue;
+      }
+
+      const spriteNum = spriteMapRef.current.get(row.agent_id) ?? ((hashStr(row.agent_id) % 12) + 1);
+      const dc = new Container();
+      const frames: Texture[] = [];
+      for (let f = 1; f <= 3; f++) {
+        const key = `${spriteNum}-D-${f}`;
+        if (textures[key]) frames.push(textures[key]);
+      }
+      if (frames.length > 0) {
+        const animSprite = new AnimatedSprite(frames);
+        animSprite.anchor.set(0.5, 1);
+        const scale = 44 / animSprite.texture.height;
+        animSprite.scale.set(scale);
+        animSprite.gotoAndStop(0);
+        dc.addChild(animSprite);
+      } else {
+        const fb = new Text({ text: "🧑‍💼", style: new TextStyle({ fontSize: 20 }) });
+        fb.anchor.set(0.5, 1);
+        dc.addChild(fb);
+      }
+
+      const badge = new Graphics();
+      const badgeColor = row.phase === "review" ? 0x34d399 : 0xf59e0b;
+      badge.roundRect(-24, 4, 48, 13, 4).fill({ color: badgeColor, alpha: 0.9 });
+      badge.roundRect(-24, 4, 48, 13, 4).stroke({ width: 1, color: 0x111111, alpha: 0.35 });
+      dc.addChild(badge);
+      const badgeText = new Text({
+        text: row.phase === "review"
+          ? pickLocale(language, LOCALE_TEXT.meetingBadgeReview)
+          : pickLocale(language, LOCALE_TEXT.meetingBadgeKickoff),
+        style: new TextStyle({ fontSize: 7, fill: 0x111111, fontWeight: "bold", fontFamily: "system-ui, sans-serif" }),
+      });
+      badgeText.anchor.set(0.5, 0.5);
+      badgeText.position.set(0, 10.5);
+      dc.addChild(badgeText);
+
+      dc.position.set(seat.x, seat.y);
+      dlLayer.addChild(dc);
+      deliveriesRef.current.push({
+        sprite: dc,
+        fromX: seat.x,
+        fromY: seat.y,
+        toX: seat.x,
+        toY: seat.y,
+        progress: 1,
+        speed: 0.0048,
+        type: "walk",
+        agentId: row.agent_id,
+        holdAtSeat: true,
+        holdUntil: row.until,
+        arrived: true,
+        meetingSeatIndex: row.seat_index,
+      });
+    }
+
+    for (let i = deliveriesRef.current.length - 1; i >= 0; i--) {
+      const d = deliveriesRef.current[i];
+      if (!d.holdAtSeat || !d.agentId || !d.arrived) continue;
+      if (activeByAgent.has(d.agentId)) continue;
+      d.sprite.parent?.removeChild(d.sprite);
+      d.sprite.destroy({ children: true });
+      deliveriesRef.current.splice(i, 1);
+    }
+  }, [meetingPresence, language, sceneRevision]);
 
   /* ── CROSS-DEPT DELIVERY ANIMATIONS (walking character) ── */
   useEffect(() => {

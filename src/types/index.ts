@@ -41,6 +41,7 @@ export interface MeetingPresence {
   agent_id: string;
   seat_index: number;
   phase: "kickoff" | "review";
+  task_id: string | null;
   until: number;
 }
 

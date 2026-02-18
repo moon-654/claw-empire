@@ -2669,6 +2669,7 @@ const reviewInFlight = new Set<string>();
 const meetingPresenceUntil = new Map<string, number>();
 const meetingSeatIndexByAgent = new Map<string, number>();
 const meetingPhaseByAgent = new Map<string, "kickoff" | "review">();
+const meetingTaskIdByAgent = new Map<string, string>();
 const MAX_REVIEW_APPROVAL_ROUNDS = 3;
 
 function getTaskStatusById(taskId: string): string | null {
@@ -2988,6 +2989,7 @@ function markAgentInMeeting(
   holdMs = 90_000,
   seatIndex?: number,
   phase?: "kickoff" | "review",
+  taskId?: string,
 ): void {
   meetingPresenceUntil.set(agentId, nowMs() + holdMs);
   if (typeof seatIndex === "number") {
@@ -2995,6 +2997,9 @@ function markAgentInMeeting(
   }
   if (phase) {
     meetingPhaseByAgent.set(agentId, phase);
+  }
+  if (taskId) {
+    meetingTaskIdByAgent.set(agentId, taskId);
   }
   const row = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as AgentRow | undefined;
   if (row?.status === "break") {
@@ -3011,6 +3016,7 @@ function isAgentInMeeting(agentId: string): boolean {
     meetingPresenceUntil.delete(agentId);
     meetingSeatIndexByAgent.delete(agentId);
     meetingPhaseByAgent.delete(agentId);
+    meetingTaskIdByAgent.delete(agentId);
     return false;
   }
   return true;
@@ -3018,7 +3024,7 @@ function isAgentInMeeting(agentId: string): boolean {
 
 function callLeadersToCeoOffice(taskId: string, leaders: AgentRow[], phase: "kickoff" | "review"): void {
   leaders.slice(0, 6).forEach((leader, seatIndex) => {
-    markAgentInMeeting(leader.id, 600_000, seatIndex, phase);
+    markAgentInMeeting(leader.id, 600_000, seatIndex, phase, taskId);
     broadcast("ceo_office_call", {
       from_agent_id: leader.id,
       seat_index: seatIndex,
@@ -3034,6 +3040,7 @@ function dismissLeadersFromCeoOffice(taskId: string, leaders: AgentRow[]): void 
     meetingPresenceUntil.delete(leader.id);
     meetingSeatIndexByAgent.delete(leader.id);
     meetingPhaseByAgent.delete(leader.id);
+    meetingTaskIdByAgent.delete(leader.id);
     broadcast("ceo_office_call", {
       from_agent_id: leader.id,
       task_id: taskId,
@@ -4010,6 +4017,7 @@ app.get("/api/meeting-presence", (_req, res) => {
     agent_id: string;
     seat_index: number;
     phase: "kickoff" | "review";
+    task_id: string | null;
     until: number;
   }> = [];
 
@@ -4018,12 +4026,14 @@ app.get("/api/meeting-presence", (_req, res) => {
       meetingPresenceUntil.delete(agentId);
       meetingSeatIndexByAgent.delete(agentId);
       meetingPhaseByAgent.delete(agentId);
+      meetingTaskIdByAgent.delete(agentId);
       continue;
     }
     presence.push({
       agent_id: agentId,
       seat_index: meetingSeatIndexByAgent.get(agentId) ?? 0,
       phase: meetingPhaseByAgent.get(agentId) ?? "kickoff",
+      task_id: meetingTaskIdByAgent.get(agentId) ?? null,
       until,
     });
   }
