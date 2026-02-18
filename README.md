@@ -416,6 +416,7 @@ With meeting:
 ```bash
 curl -X POST http://127.0.0.1:8790/api/inbox \
   -H "content-type: application/json" \
+  -H "x-inbox-secret: $INBOX_WEBHOOK_SECRET" \
   -d '{"source":"telegram","author":"ceo","text":"$Release v0.2 by Friday with QA sign-off","project_path":"/Users/me/Projects/climpire"}'
 ```
 
@@ -424,6 +425,7 @@ Without meeting:
 ```bash
 curl -X POST http://127.0.0.1:8790/api/inbox \
   -H "content-type: application/json" \
+  -H "x-inbox-secret: $INBOX_WEBHOOK_SECRET" \
   -d '{"source":"telegram","author":"ceo","text":"$Hotfix production login bug immediately","skipPlannedMeeting":true,"project_context":"existing climpire project"}'
 ```
 
@@ -438,6 +440,9 @@ Copy `.env.example` to `.env`. All secrets stay local — never commit `.env`.
 | `OAUTH_ENCRYPTION_SECRET` | **Yes** | Encrypts OAuth tokens in SQLite |
 | `PORT` | No | Server port (default: `8790`) |
 | `HOST` | No | Bind address (default: `127.0.0.1`) |
+| `API_AUTH_TOKEN` | Recommended | Bearer token for non-loopback API/WebSocket access |
+| `VITE_API_AUTH_TOKEN` | Optional | Frontend token (must match `API_AUTH_TOKEN` when remote UI access is needed) |
+| `INBOX_WEBHOOK_SECRET` | **Yes for `/api/inbox`** | Shared secret required in `x-inbox-secret` header |
 | `DB_PATH` | No | SQLite database path (default: `./claw-empire.sqlite`) |
 | `LOGS_DIR` | No | Log directory (default: `./logs`) |
 | `OAUTH_GITHUB_CLIENT_ID` | No | GitHub OAuth App client ID |

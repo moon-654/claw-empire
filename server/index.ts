@@ -3,7 +3,7 @@ import cors from "cors";
 import path from "path";
 import fs from "node:fs";
 import os from "node:os";
-import { randomUUID, createHash, randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
+import { randomUUID, createHash, randomBytes, createCipheriv, createDecipheriv, timingSafeEqual } from "node:crypto";
 import { spawn, execFile, execFileSync, type ChildProcess } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { WebSocketServer, WebSocket } from "ws";
@@ -58,6 +58,7 @@ function normalizeSecret(raw: string | undefined): string {
 }
 
 const API_AUTH_TOKEN = normalizeSecret(process.env.API_AUTH_TOKEN);
+const INBOX_WEBHOOK_SECRET = normalizeSecret(process.env.INBOX_WEBHOOK_SECRET);
 const SESSION_AUTH_TOKEN = API_AUTH_TOKEN || randomBytes(32).toString("hex");
 const ALLOWED_ORIGIN_SUFFIXES = (process.env.ALLOWED_ORIGIN_SUFFIXES ?? ".ts.net")
   .split(",")
@@ -156,9 +157,17 @@ function issueSessionCookie(req: Request, res: Response): void {
 function isPublicApiPath(pathname: string): boolean {
   if (pathname === "/api/health") return true;
   if (pathname === "/api/auth/session") return true;
+  if (pathname === "/api/inbox") return true;
   if (pathname === "/api/oauth/start") return true;
   if (pathname.startsWith("/api/oauth/callback/")) return true;
   return false;
+}
+
+function safeSecretEquals(input: string, expected: string): boolean {
+  const a = Buffer.from(input, "utf8");
+  const b = Buffer.from(expected, "utf8");
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
 }
 
 function incomingMessageBearerToken(req: IncomingMessage): string | null {
@@ -8881,6 +8890,14 @@ app.post("/api/directives", (req, res) => {
 
 // ── Inbound webhook (Telegram / external) ───────────────────────────────────
 app.post("/api/inbox", (req, res) => {
+  if (!INBOX_WEBHOOK_SECRET) {
+    return res.status(503).json({ error: "inbox_webhook_secret_not_configured" });
+  }
+  const providedSecret = req.header("x-inbox-secret") ?? "";
+  if (!safeSecretEquals(providedSecret, INBOX_WEBHOOK_SECRET)) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
   const body = req.body ?? {};
   const text = body.text;
   if (!text || typeof text !== "string" || !text.trim()) {
