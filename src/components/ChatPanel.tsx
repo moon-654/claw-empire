@@ -1,9 +1,10 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
-import type { Agent, Message } from '../types';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import type { Agent, Message, Project } from '../types';
 import MessageContent from './MessageContent';
 import AgentAvatar, { buildSpriteMap } from './AgentAvatar';
 import { useI18n } from '../i18n';
 import type { LangText } from '../i18n';
+import { createProject, getProjects } from '../api';
 
 export interface StreamingMessage {
   message_id: string;
@@ -18,14 +19,44 @@ interface ChatPanelProps {
   messages: Message[];
   agents: Agent[];
   streamingMessage?: StreamingMessage | null;
-  onSendMessage: (content: string, receiverType: 'agent' | 'department' | 'all', receiverId?: string, messageType?: string) => void;
+  onSendMessage: (
+    content: string,
+    receiverType: 'agent' | 'department' | 'all',
+    receiverId?: string,
+    messageType?: string,
+    projectMeta?: {
+      project_id?: string;
+      project_path?: string;
+      project_context?: string;
+    },
+  ) => void;
   onSendAnnouncement: (content: string) => void;
-  onSendDirective: (content: string) => void;
+  onSendDirective: (
+    content: string,
+    projectMeta?: {
+      project_id?: string;
+      project_path?: string;
+      project_context?: string;
+    },
+  ) => void;
   onClearMessages?: (agentId?: string) => void;
   onClose: () => void;
 }
 
 type ChatMode = 'chat' | 'task' | 'announcement' | 'report';
+type ProjectMetaPayload = {
+  project_id?: string;
+  project_path?: string;
+  project_context?: string;
+};
+
+type PendingSendAction =
+  | { kind: 'directive'; content: string }
+  | { kind: 'announcement'; content: string }
+  | { kind: 'task'; content: string; receiverId: string }
+  | { kind: 'report'; content: string; receiverId: string }
+  | { kind: 'chat'; content: string; receiverId: string }
+  | { kind: 'broadcast'; content: string };
 
 const STATUS_COLORS: Record<string, string> = {
   idle: 'bg-green-400',
@@ -147,39 +178,200 @@ export function ChatPanel({
   }, [selectedAgent]);
 
   const isDirectiveMode = input.trimStart().startsWith('$');
+  const [pendingSend, setPendingSend] = useState<PendingSendAction | null>(null);
+  const [projectFlowOpen, setProjectFlowOpen] = useState(false);
+  const [projectFlowStep, setProjectFlowStep] = useState<'choose' | 'existing' | 'new' | 'confirm'>('choose');
+  const [projectItems, setProjectItems] = useState<Project[]>([]);
+  const [projectLoading, setProjectLoading] = useState(false);
+  const [selectedProject, setSelectedProject] = useState<Project | null>(null);
+  const [existingProjectInput, setExistingProjectInput] = useState('');
+  const [existingProjectError, setExistingProjectError] = useState('');
+  const [newProjectName, setNewProjectName] = useState('');
+  const [newProjectPath, setNewProjectPath] = useState('');
+  const [newProjectGoal, setNewProjectGoal] = useState('');
+  const [projectSaving, setProjectSaving] = useState(false);
+  const isDirectivePending = pendingSend?.kind === 'directive';
+
+  const closeProjectFlow = () => {
+    setProjectFlowOpen(false);
+    setProjectFlowStep('choose');
+    setPendingSend(null);
+    setSelectedProject(null);
+    setExistingProjectInput('');
+    setExistingProjectError('');
+    setNewProjectName('');
+    setNewProjectPath('');
+    setNewProjectGoal('');
+    setProjectItems([]);
+  };
+
+  const loadRecentProjects = useCallback(async () => {
+    setProjectLoading(true);
+    try {
+      const res = await getProjects({ page: 1, page_size: 10 });
+      setProjectItems(res.projects.slice(0, 10));
+    } catch (err) {
+      console.error('Failed to load projects:', err);
+    } finally {
+      setProjectLoading(false);
+    }
+  }, []);
+
+  const resolveExistingProjectSelection = useCallback((raw: string): Project | null => {
+    const trimmed = raw.trim();
+    if (!trimmed || projectItems.length === 0) return null;
+
+    if (/^\d+$/.test(trimmed)) {
+      const idx = Number.parseInt(trimmed, 10);
+      if (idx >= 1 && idx <= projectItems.length) {
+        return projectItems[idx - 1];
+      }
+    }
+
+    const query = trimmed.toLowerCase();
+    const tokens = query.split(/\s+/).filter(Boolean);
+    let best: { project: Project; score: number } | null = null;
+
+    for (const p of projectItems) {
+      const name = p.name.toLowerCase();
+      const path = p.project_path.toLowerCase();
+      const goal = p.core_goal.toLowerCase();
+      let score = 0;
+
+      if (name === query) score = Math.max(score, 100);
+      if (name.startsWith(query)) score = Math.max(score, 90);
+      if (name.includes(query)) score = Math.max(score, 80);
+      if (path === query) score = Math.max(score, 75);
+      if (path.includes(query)) score = Math.max(score, 65);
+      if (goal.includes(query)) score = Math.max(score, 50);
+
+      if (tokens.length > 0) {
+        const tokenHits = tokens.filter((tk) => name.includes(tk) || path.includes(tk) || goal.includes(tk)).length;
+        score = Math.max(score, tokenHits * 20);
+      }
+
+      if (!best || score > best.score) {
+        best = { project: p, score };
+      }
+    }
+
+    if (!best || best.score < 50) return null;
+    return best.project;
+  }, [projectItems]);
+
+  const applyExistingProjectSelection = useCallback(() => {
+    const picked = resolveExistingProjectSelection(existingProjectInput);
+    if (!picked) {
+      setExistingProjectError(tr('번호(1-10) 또는 프로젝트명을 다시 입력해주세요.', 'Please enter a number (1-10) or a project name.', '番号(1-10)またはプロジェクト名を入力してください。', '请输入编号(1-10)或项目名称。'));
+      return;
+    }
+    setExistingProjectError('');
+    setSelectedProject(picked);
+    setProjectFlowStep('confirm');
+  }, [existingProjectInput, resolveExistingProjectSelection]);
+
+  const dispatchPending = useCallback((action: PendingSendAction, projectMeta?: ProjectMetaPayload) => {
+    if (action.kind === 'directive') {
+      onSendDirective(action.content, projectMeta);
+      return;
+    }
+    if (action.kind === 'announcement') {
+      onSendAnnouncement(action.content);
+      return;
+    }
+    if (action.kind === 'task') {
+      onSendMessage(action.content, 'agent', action.receiverId, 'task_assign', projectMeta);
+      return;
+    }
+    if (action.kind === 'report') {
+      onSendMessage(action.content, 'agent', action.receiverId, 'report', projectMeta);
+      return;
+    }
+    if (action.kind === 'chat') {
+      onSendMessage(action.content, 'agent', action.receiverId, 'chat', projectMeta);
+      return;
+    }
+    onSendMessage(action.content, 'all', undefined, undefined, projectMeta);
+  }, [onSendAnnouncement, onSendDirective, onSendMessage]);
+
+  const handleConfirmProject = () => {
+    if (!pendingSend || !selectedProject) return;
+    const projectMeta: ProjectMetaPayload = {
+      project_id: selectedProject.id,
+      project_path: selectedProject.project_path,
+      project_context: selectedProject.core_goal,
+    };
+    dispatchPending(pendingSend, projectMeta);
+    setInput('');
+    textareaRef.current?.focus();
+    closeProjectFlow();
+  };
+
+  const handleCreateProject = async () => {
+    const goal = isDirectivePending ? (pendingSend?.content ?? '').trim() : newProjectGoal.trim();
+    if (!newProjectName.trim() || !newProjectPath.trim() || !goal || projectSaving) return;
+    setProjectSaving(true);
+    try {
+      const created = await createProject({
+        name: newProjectName.trim(),
+        project_path: newProjectPath.trim(),
+        core_goal: goal,
+      });
+      setSelectedProject(created);
+      setProjectFlowStep('confirm');
+    } catch (err) {
+      console.error('Failed to create project:', err);
+    } finally {
+      setProjectSaving(false);
+    }
+  };
+
+  const openProjectBranch = (action: PendingSendAction) => {
+    setPendingSend(action);
+    setProjectFlowOpen(true);
+    setProjectFlowStep('choose');
+    setSelectedProject(null);
+    setExistingProjectInput('');
+    setExistingProjectError('');
+    setProjectItems([]);
+    setNewProjectGoal(action.kind === 'directive' ? action.content : '');
+  };
 
   const handleSend = () => {
     const trimmed = input.trim();
     if (!trimmed) return;
 
-    // $ directive — priority over all modes
+    let action: PendingSendAction;
     if (trimmed.startsWith('$')) {
       const directiveContent = trimmed.slice(1).trim();
-      if (directiveContent) {
-        onSendDirective(directiveContent);
-        setInput('');
-        textareaRef.current?.focus();
-        return;
-      }
-    }
-
-    if (mode === 'announcement') {
-      onSendAnnouncement(trimmed);
+      if (!directiveContent) return;
+      action = { kind: 'directive', content: directiveContent };
+    } else if (mode === 'announcement') {
+      action = { kind: 'announcement', content: trimmed };
     } else if (mode === 'task' && selectedAgent) {
-      onSendMessage(trimmed, 'agent', selectedAgent.id, 'task_assign');
+      action = { kind: 'task', content: trimmed, receiverId: selectedAgent.id };
     } else if (mode === 'report' && selectedAgent) {
-      onSendMessage(
-        `[${tr('보고 요청', 'Report Request', 'レポート依頼', '报告请求')}] ${trimmed}`,
-        'agent',
-        selectedAgent.id,
-        'report'
-      );
+      action = {
+        kind: 'report',
+        content: `[${tr('보고 요청', 'Report Request', 'レポート依頼', '报告请求')}] ${trimmed}`,
+        receiverId: selectedAgent.id,
+      };
     } else if (selectedAgent) {
-      onSendMessage(trimmed, 'agent', selectedAgent.id, 'chat');
+      action = { kind: 'chat', content: trimmed, receiverId: selectedAgent.id };
     } else {
-      onSendMessage(trimmed, 'all');
+      action = { kind: 'broadcast', content: trimmed };
     }
 
+    const isTaskInstruction = action.kind === 'directive' || action.kind === 'task';
+    // Always ask project branch before task/directive execution.
+    const needsProjectBranch = isTaskInstruction;
+
+    if (needsProjectBranch) {
+      openProjectBranch(action);
+      return;
+    }
+
+    dispatchPending(action);
     setInput('');
     textareaRef.current?.focus();
   };
@@ -191,33 +383,37 @@ export function ChatPanel({
     }
   };
 
+  useEffect(() => {
+    if (!projectFlowOpen) return;
+    if (projectFlowStep !== 'existing') return;
+    void loadRecentProjects();
+  }, [projectFlowOpen, projectFlowStep, loadRecentProjects]);
+
   const isAnnouncementMode = mode === 'announcement';
 
-  // Filter messages relevant to current view
-  const visibleMessages = messages.filter((msg) => {
-    if (!selectedAgent) {
-      // Show only announcements / all broadcasts when no agent selected
+  // Filter messages relevant to current view (memoized to avoid re-filtering on every render)
+  const selectedAgentId = selectedAgent?.id;
+  const visibleMessages = useMemo(() => messages.filter((msg) => {
+    if (!selectedAgentId) {
       return msg.receiver_type === 'all' || msg.message_type === 'announcement' || msg.message_type === 'directive';
     }
-    // Always include messages tied to the selected agent's active task.
     if (selectedTaskId && msg.task_id === selectedTaskId) return true;
-    // Show messages between CEO and selected agent
     return (
       (msg.sender_type === 'ceo' &&
         msg.receiver_type === 'agent' &&
-        msg.receiver_id === selectedAgent.id) ||
+        msg.receiver_id === selectedAgentId) ||
       (msg.sender_type === 'agent' &&
-        msg.sender_id === selectedAgent.id) ||
+        msg.sender_id === selectedAgentId) ||
       msg.message_type === 'announcement' ||
       msg.message_type === 'directive' ||
       msg.receiver_type === 'all'
     );
-  });
+  }), [messages, selectedAgentId, selectedTaskId]);
 
   return (
     <div className="fixed inset-0 z-50 flex h-full w-full flex-col bg-gray-900 shadow-2xl lg:relative lg:inset-auto lg:z-auto lg:w-96 lg:border-l lg:border-gray-700">
       {/* Header */}
-      <div className="flex items-center gap-3 px-4 py-3 bg-gray-800 border-b border-gray-700 flex-shrink-0">
+      <div className="chat-header flex items-center gap-3 px-4 py-3 bg-gray-800 flex-shrink-0">
         {selectedAgent ? (
           <>
             {/* Agent avatar */}
@@ -535,6 +731,243 @@ export function ChatPanel({
               )}
             </>
           )}
+        </div>
+      )}
+
+      {projectFlowOpen && (
+        <div className="absolute inset-0 z-[70] flex items-center justify-center bg-black/75 p-4">
+          <div className="w-full max-w-md rounded-xl border border-slate-700 bg-slate-900 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-700 px-4 py-3">
+              <h3 className="text-sm font-semibold text-white">
+                {tr('프로젝트 분기', 'Project Branch', 'プロジェクト分岐', '项目分支')}
+              </h3>
+              <button
+                type="button"
+                onClick={closeProjectFlow}
+                className="rounded-md px-2 py-1 text-xs text-slate-400 hover:bg-slate-800 hover:text-white"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-3 px-4 py-4 text-sm">
+              {projectFlowStep === 'choose' && (
+                <>
+                  <p className="text-slate-200">
+                    {tr(
+                      '기존 프로젝트인가요? 신규 프로젝트인가요?',
+                      'Is this an existing project or a new project?',
+                      '既存プロジェクトですか？新規プロジェクトですか？',
+                      '这是已有项目还是新项目？',
+                    )}
+                  </p>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setProjectFlowStep('existing');
+                        setExistingProjectInput('');
+                        setExistingProjectError('');
+                        void loadRecentProjects();
+                      }}
+                      className="flex-1 rounded-lg bg-blue-600 px-3 py-2 text-xs font-medium text-white hover:bg-blue-500"
+                    >
+                      {tr('기존 프로젝트', 'Existing Project', '既存プロジェクト', '已有项目')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setProjectFlowStep('new')}
+                      className="flex-1 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-medium text-white hover:bg-emerald-500"
+                    >
+                      {tr('신규 프로젝트', 'New Project', '新規プロジェクト', '新项目')}
+                    </button>
+                  </div>
+                </>
+              )}
+
+              {projectFlowStep === 'existing' && (
+                <>
+                  <p className="text-xs text-slate-400">
+                    {tr(
+                      '최근 프로젝트 10개를 보여드립니다. 번호(1-10) 또는 프로젝트명을 입력하세요.',
+                      'Showing 10 recent projects. Enter a number (1-10) or project name.',
+                      '最新プロジェクト10件を表示します。番号(1-10)またはプロジェクト名を入力してください。',
+                      '显示最近 10 个项目。请输入编号(1-10)或项目名称。',
+                    )}
+                  </p>
+                  {projectLoading ? (
+                    <p className="text-xs text-slate-500">{tr('불러오는 중...', 'Loading...', '読み込み中...', '加载中...')}</p>
+                  ) : projectItems.length === 0 ? (
+                    <p className="text-xs text-slate-500">{tr('프로젝트가 없습니다', 'No projects', 'プロジェクトなし', '暂无项目')}</p>
+                  ) : (
+                    <div className="max-h-52 space-y-2 overflow-y-auto pr-1">
+                      {projectItems.map((p, idx) => (
+                        <div key={p.id} className="rounded-lg border border-slate-700 bg-slate-800/60 p-2">
+                          <p className="text-xs font-medium text-slate-100">
+                            <span className="mr-1 text-blue-300">{idx + 1}.</span>
+                            {p.name}
+                          </p>
+                          <p className="truncate text-[11px] text-slate-400">{p.project_path}</p>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSelectedProject(p);
+                              setExistingProjectInput(String(idx + 1));
+                              setExistingProjectError('');
+                              setProjectFlowStep('confirm');
+                            }}
+                            className="mt-2 rounded bg-blue-700 px-2 py-1 text-[11px] text-white hover:bg-blue-600"
+                          >
+                            {tr('선택', 'Select', '選択', '选择')}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div className="space-y-2 pt-1">
+                    <input
+                      type="text"
+                      value={existingProjectInput}
+                      onChange={(e) => {
+                        setExistingProjectInput(e.target.value);
+                        if (existingProjectError) setExistingProjectError('');
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          applyExistingProjectSelection();
+                        }
+                      }}
+                      placeholder={tr(
+                        '예: 1 또는 프로젝트명',
+                        'e.g. 1 or project name',
+                        '例: 1 またはプロジェクト名',
+                        '例如：1 或项目名',
+                      )}
+                      className="w-full rounded border border-slate-700 bg-slate-800 px-2 py-1.5 text-xs text-slate-100 outline-none focus:border-blue-500"
+                    />
+                    {existingProjectError && (
+                      <p className="text-[11px] text-rose-300">{existingProjectError}</p>
+                    )}
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={applyExistingProjectSelection}
+                        className="flex-1 rounded bg-blue-700 px-2 py-1.5 text-[11px] text-white hover:bg-blue-600"
+                      >
+                        {tr('입력값으로 선택', 'Select from input', '入力値で選択', '按输入选择')}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setProjectFlowStep('choose')}
+                        className="rounded border border-slate-700 px-2 py-1.5 text-[11px] text-slate-300"
+                      >
+                        {tr('뒤로', 'Back', '戻る', '返回')}
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {projectFlowStep === 'new' && (
+                <>
+                  <input
+                    type="text"
+                    value={newProjectName}
+                    onChange={(e) => setNewProjectName(e.target.value)}
+                    placeholder={tr('프로젝트 이름', 'Project name', 'プロジェクト名', '项目名称')}
+                    className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-white outline-none focus:border-blue-500"
+                  />
+                  <input
+                    type="text"
+                    value={newProjectPath}
+                    onChange={(e) => setNewProjectPath(e.target.value)}
+                    placeholder={tr('프로젝트 경로', 'Project path', 'プロジェクトパス', '项目路径')}
+                    className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-white outline-none focus:border-blue-500"
+                  />
+                  <textarea
+                    rows={3}
+                    value={newProjectGoal}
+                    onChange={(e) => setNewProjectGoal(e.target.value)}
+                    readOnly={isDirectivePending}
+                    placeholder={tr('핵심 목표', 'Core goal', 'コア目標', '核心目标')}
+                    className="w-full resize-none rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-white outline-none focus:border-blue-500"
+                  />
+                  {isDirectivePending && (
+                    <p className="text-[11px] text-slate-400">
+                      {tr(
+                        '$ 업무지시 내용이 신규 프로젝트의 핵심 목표로 자동 반영됩니다.',
+                        'The $ directive text is automatically used as the new project core goal.',
+                        '$業務指示の内容が新規プロジェクトのコア目標として自動反映されます。',
+                        '$ 指令内容会自动作为新项目核心目标。',
+                      )}
+                    </p>
+                  )}
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={handleCreateProject}
+                      disabled={
+                        !newProjectName.trim()
+                        || !newProjectPath.trim()
+                        || !(isDirectivePending ? (pendingSend?.content ?? '').trim() : newProjectGoal.trim())
+                        || projectSaving
+                      }
+                      className="flex-1 rounded bg-emerald-700 px-3 py-2 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-40"
+                    >
+                      {projectSaving
+                        ? tr('등록 중...', 'Creating...', '作成中...', '创建中...')
+                        : tr('등록 후 선택', 'Create & Select', '作成して選択', '创建并选择')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setProjectFlowStep('choose')}
+                      className="rounded border border-slate-700 px-3 py-2 text-xs text-slate-300"
+                    >
+                      {tr('뒤로', 'Back', '戻る', '返回')}
+                    </button>
+                  </div>
+                </>
+              )}
+
+              {projectFlowStep === 'confirm' && selectedProject && (
+                <>
+                  <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3">
+                    <p className="text-xs font-semibold text-white">{selectedProject.name}</p>
+                    <p className="mt-1 text-[11px] text-slate-400">{selectedProject.project_path}</p>
+                    <p className="mt-1 text-[11px] text-slate-300">{selectedProject.core_goal}</p>
+                  </div>
+                  <div className="rounded-lg border border-blue-700/40 bg-blue-900/20 p-3 text-[11px] text-blue-100">
+                    <p className="font-medium">{tr('라운드 목표', 'Round Goal', 'ラウンド目標', '回合目标')}</p>
+                    <p className="mt-1 leading-relaxed">
+                      {tr(
+                        `프로젝트 핵심목표(${selectedProject.core_goal})를 기준으로 이번 요청(${pendingSend?.content ?? ''})을 실행 가능한 산출물로 완수`,
+                        `Execute this round with project core goal (${selectedProject.core_goal}) and current request (${pendingSend?.content ?? ''}).`,
+                        `プロジェクト目標(${selectedProject.core_goal})と今回依頼(${pendingSend?.content ?? ''})を基準に実行可能な成果物を完了します。`,
+                        `以项目核心目标（${selectedProject.core_goal}）和本次请求（${pendingSend?.content ?? ''}）为基础完成本轮可执行产出。`,
+                      )}
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={handleConfirmProject}
+                      className="flex-1 rounded bg-blue-600 px-3 py-2 text-xs font-medium text-white hover:bg-blue-500"
+                    >
+                      {tr('선택 후 전송', 'Select & Send', '選択して送信', '选择并发送')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setProjectFlowStep('choose')}
+                      className="rounded border border-slate-700 px-3 py-2 text-xs text-slate-300"
+                    >
+                      {tr('다시 선택', 'Re-select', '再選択', '重新选择')}
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
         </div>
       )}
 

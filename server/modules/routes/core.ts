@@ -4,7 +4,7 @@ import type { RuntimeContext } from "../../types/runtime-context.ts";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn, execFile, execFileSync } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
 import { INBOX_WEBHOOK_SECRET, PKG_VERSION } from "../../config/runtime.ts";
 import { notifyTaskStatus, gatewayHttpInvoke } from "../../gateway/client.ts";
@@ -82,6 +82,8 @@ export function registerRoutesPartA(ctx: RuntimeContext): Record<string, never> 
   const randomDelay = __ctx.randomDelay;
   const recordAcceptedIngressAuditOrRollback = __ctx.recordAcceptedIngressAuditOrRollback;
   const recordMessageIngressAuditOr503 = __ctx.recordMessageIngressAuditOr503;
+  const recordTaskCreationAudit = __ctx.recordTaskCreationAudit;
+  const setTaskCreationAuditCompletion = __ctx.setTaskCreationAuditCompletion;
   const refreshGoogleToken = __ctx.refreshGoogleToken;
   const removeActiveOAuthAccount = __ctx.removeActiveOAuthAccount;
   const resolveMessageIdempotencyKey = __ctx.resolveMessageIdempotencyKey;
@@ -397,6 +399,157 @@ app.get("/api/departments/:id", (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Projects
+// ---------------------------------------------------------------------------
+app.get("/api/projects", (req, res) => {
+  const page = Math.max(Number(firstQueryValue(req.query.page)) || 1, 1);
+  const pageSizeRaw = Number(firstQueryValue(req.query.page_size)) || 10;
+  const pageSize = Math.min(Math.max(pageSizeRaw, 1), 50);
+  const search = normalizeTextField(firstQueryValue(req.query.search));
+
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+  if (search) {
+    conditions.push("(p.name LIKE ? OR p.project_path LIKE ? OR p.core_goal LIKE ?)");
+    const pattern = `%${search}%`;
+    params.push(pattern, pattern, pattern);
+  }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  const totalRow = db.prepare(`
+    SELECT COUNT(*) AS cnt
+    FROM projects p
+    ${where}
+  `).get(...(params as SQLInputValue[])) as { cnt: number };
+  const total = Number(totalRow?.cnt ?? 0) || 0;
+  const totalPages = total > 0 ? Math.ceil(total / pageSize) : 1;
+  const offset = (page - 1) * pageSize;
+
+  const rows = db.prepare(`
+    SELECT p.*,
+           (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) AS task_count
+    FROM projects p
+    ${where}
+    ORDER BY COALESCE(p.last_used_at, p.updated_at) DESC, p.updated_at DESC, p.created_at DESC
+    LIMIT ? OFFSET ?
+  `).all(...([...(params as SQLInputValue[]), pageSize, offset] as SQLInputValue[]));
+
+  res.json({
+    projects: rows,
+    page,
+    page_size: pageSize,
+    total,
+    total_pages: totalPages,
+  });
+});
+
+app.post("/api/projects", (req, res) => {
+  const body = req.body ?? {};
+  const name = normalizeTextField(body.name);
+  const projectPath = normalizeTextField(body.project_path);
+  const coreGoal = normalizeTextField(body.core_goal);
+  if (!name) return res.status(400).json({ error: "name_required" });
+  if (!projectPath) return res.status(400).json({ error: "project_path_required" });
+  if (!coreGoal) return res.status(400).json({ error: "core_goal_required" });
+
+  const id = randomUUID();
+  const t = nowMs();
+  db.prepare(`
+    INSERT INTO projects (id, name, project_path, core_goal, last_used_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(id, name, projectPath, coreGoal, t, t, t);
+
+  const project = db.prepare("SELECT * FROM projects WHERE id = ?").get(id);
+  res.json({ ok: true, project });
+});
+
+app.patch("/api/projects/:id", (req, res) => {
+  const id = String(req.params.id);
+  const existing = db.prepare("SELECT * FROM projects WHERE id = ?").get(id);
+  if (!existing) return res.status(404).json({ error: "not_found" });
+
+  const body = req.body ?? {};
+  const updates: string[] = ["updated_at = ?"];
+  const params: unknown[] = [nowMs()];
+
+  if ("name" in body) {
+    const value = normalizeTextField(body.name);
+    if (!value) return res.status(400).json({ error: "name_required" });
+    updates.push("name = ?");
+    params.push(value);
+  }
+  if ("project_path" in body) {
+    const value = normalizeTextField(body.project_path);
+    if (!value) return res.status(400).json({ error: "project_path_required" });
+    updates.push("project_path = ?");
+    params.push(value);
+  }
+  if ("core_goal" in body) {
+    const value = normalizeTextField(body.core_goal);
+    if (!value) return res.status(400).json({ error: "core_goal_required" });
+    updates.push("core_goal = ?");
+    params.push(value);
+  }
+
+  if (updates.length <= 1) {
+    return res.status(400).json({ error: "no_fields" });
+  }
+
+  params.push(id);
+  db.prepare(`UPDATE projects SET ${updates.join(", ")} WHERE id = ?`).run(...(params as SQLInputValue[]));
+  const project = db.prepare("SELECT * FROM projects WHERE id = ?").get(id);
+  res.json({ ok: true, project });
+});
+
+app.delete("/api/projects/:id", (req, res) => {
+  const id = String(req.params.id);
+  const existing = db.prepare("SELECT id FROM projects WHERE id = ?").get(id);
+  if (!existing) return res.status(404).json({ error: "not_found" });
+
+  // Keep task history while removing relation.
+  db.prepare("UPDATE tasks SET project_id = NULL WHERE project_id = ?").run(id);
+  db.prepare("DELETE FROM projects WHERE id = ?").run(id);
+  res.json({ ok: true });
+});
+
+app.get("/api/projects/:id", (req, res) => {
+  const id = String(req.params.id);
+  const project = db.prepare("SELECT * FROM projects WHERE id = ?").get(id);
+  if (!project) return res.status(404).json({ error: "not_found" });
+
+  const tasks = db.prepare(`
+    SELECT t.id, t.title, t.status, t.task_type, t.priority, t.created_at, t.updated_at, t.completed_at,
+           t.source_task_id,
+           t.assigned_agent_id,
+           COALESCE(a.name, '') AS assigned_agent_name,
+           COALESCE(a.name_ko, '') AS assigned_agent_name_ko
+    FROM tasks t
+    LEFT JOIN agents a ON a.id = t.assigned_agent_id
+    WHERE t.project_id = ?
+    ORDER BY t.created_at DESC
+    LIMIT 300
+  `).all(id);
+
+  const reports = db.prepare(`
+    SELECT t.id, t.title, t.completed_at, t.created_at, t.assigned_agent_id,
+           COALESCE(a.name, '') AS agent_name,
+           COALESCE(a.name_ko, '') AS agent_name_ko,
+           COALESCE(d.name, '') AS dept_name,
+           COALESCE(d.name_ko, '') AS dept_name_ko
+    FROM tasks t
+    LEFT JOIN agents a ON a.id = t.assigned_agent_id
+    LEFT JOIN departments d ON d.id = t.department_id
+    WHERE t.project_id = ?
+      AND t.status = 'done'
+      AND (t.source_task_id IS NULL OR TRIM(t.source_task_id) = '')
+    ORDER BY t.completed_at DESC, t.created_at DESC
+    LIMIT 200
+  `).all(id);
+
+  res.json({ project, tasks, reports });
+});
+
+// ---------------------------------------------------------------------------
 // Agents
 // ---------------------------------------------------------------------------
 app.get("/api/agents", (_req, res) => {
@@ -444,6 +597,150 @@ app.get("/api/meeting-presence", (_req, res) => {
   res.json({ presence });
 });
 
+type SystemProcessInfo = {
+  pid: number;
+  ppid: number | null;
+  name: string;
+  command: string;
+};
+
+type ManagedProcessProvider = "claude" | "codex" | "gemini" | "opencode" | "node" | "python";
+
+const CLI_EXECUTABLE_PROVIDER_MAP: Record<string, ManagedProcessProvider> = {
+  "claude": "claude",
+  "claude.exe": "claude",
+  "codex": "codex",
+  "codex.exe": "codex",
+  "gemini": "gemini",
+  "gemini.exe": "gemini",
+  "opencode": "opencode",
+  "opencode.exe": "opencode",
+  "node": "node",
+  "node.exe": "node",
+  "python": "python",
+  "python.exe": "python",
+  "python3": "python",
+  "python3.exe": "python",
+  "py": "python",
+  "py.exe": "python",
+};
+
+function detectCliProviderFromExecutable(name: string): ManagedProcessProvider | null {
+  const normalized = path.basename(String(name ?? "")).trim().toLowerCase();
+  if (CLI_EXECUTABLE_PROVIDER_MAP[normalized]) return CLI_EXECUTABLE_PROVIDER_MAP[normalized];
+  // e.g. python3.11, python3.12 on macOS/Linux
+  if (normalized.startsWith("python")) return "python";
+  return null;
+}
+
+function runExecFileText(cmd: string, args: string[], timeoutMs = 15000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      cmd,
+      args,
+      { encoding: "utf8", timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) {
+          (err as any).stderr = stderr;
+          reject(err);
+          return;
+        }
+        resolve(String(stdout ?? ""));
+      },
+    );
+  });
+}
+
+function parseUnixProcessTable(raw: string): SystemProcessInfo[] {
+  const lines = raw.split(/\r?\n/);
+  const rows: SystemProcessInfo[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s*(.*)$/);
+    if (!match) continue;
+    const pid = Number.parseInt(match[1], 10);
+    const ppid = Number.parseInt(match[2], 10);
+    const name = String(match[3] ?? "").trim();
+    const args = String(match[4] ?? "").trim();
+    if (!Number.isFinite(pid) || pid <= 0) continue;
+    rows.push({
+      pid,
+      ppid: Number.isFinite(ppid) && ppid >= 0 ? ppid : null,
+      name,
+      command: args || name,
+    });
+  }
+  return rows;
+}
+
+function parseWindowsProcessJson(raw: string): SystemProcessInfo[] {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  const items = Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []);
+  const rows: SystemProcessInfo[] = [];
+  for (const item of items) {
+    const pid = Number(item?.ProcessId ?? item?.processid ?? item?.pid);
+    if (!Number.isFinite(pid) || pid <= 0) continue;
+    const ppidRaw = Number(item?.ParentProcessId ?? item?.parentprocessid ?? item?.ppid);
+    const name = String(item?.Name ?? item?.name ?? "").trim();
+    const commandLine = String(item?.CommandLine ?? item?.commandline ?? "").trim();
+    rows.push({
+      pid,
+      ppid: Number.isFinite(ppidRaw) && ppidRaw >= 0 ? ppidRaw : null,
+      name,
+      command: commandLine || name,
+    });
+  }
+  return rows;
+}
+
+async function listSystemProcesses(): Promise<SystemProcessInfo[]> {
+  if (process.platform === "win32") {
+    const psCommand = "$ErrorActionPreference='Stop'; Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress";
+    const candidates = ["powershell.exe", "powershell", "pwsh.exe", "pwsh"];
+    for (const shell of candidates) {
+      try {
+        const stdout = await runExecFileText(shell, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCommand], 20000);
+        const parsed = parseWindowsProcessJson(stdout);
+        if (parsed.length) return parsed;
+      } catch {
+        // try next shell binary
+      }
+    }
+    // Fallback: tasklist (command line is unavailable, but PID/name are enough for kill).
+    try {
+      const stdout = await runExecFileText("tasklist", ["/FO", "CSV", "/NH"], 20000);
+      const rows: SystemProcessInfo[] = [];
+      for (const line of stdout.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const match = trimmed.match(/^"([^"]+)","([^"]+)"/);
+        if (!match) continue;
+        const name = String(match[1] ?? "").trim();
+        const pid = Number.parseInt(String(match[2] ?? "").replace(/[^\d]/g, ""), 10);
+        if (!Number.isFinite(pid) || pid <= 0) continue;
+        rows.push({ pid, ppid: null, name, command: name });
+      }
+      return rows;
+    } catch {
+      return [];
+    }
+  }
+
+  const stdout = await runExecFileText("ps", ["-eo", "pid=,ppid=,comm=,args="], 15000);
+  return parseUnixProcessTable(stdout);
+}
+
+function isTaskExecutionStatus(status: string | null | undefined): boolean {
+  const normalized = String(status ?? "").trim().toLowerCase();
+  return normalized === "planned" || normalized === "collaborating" || normalized === "in_progress" || normalized === "review";
+}
+
 // ── Active Agents Status (must be before /api/agents/:id to avoid param capture) ──
 app.get("/api/agents/active", (_req, res) => {
   try {
@@ -480,6 +777,180 @@ app.get("/api/agents/active", (_req, res) => {
     console.error("[active-agents]", err);
     res.status(500).json({ ok: false, error: "Failed to fetch active agents" });
   }
+});
+
+app.get("/api/agents/cli-processes", async (_req, res) => {
+  try {
+    const allProcesses = await listSystemProcesses();
+    const cliProcesses = allProcesses
+      .map((proc) => {
+        const provider = detectCliProviderFromExecutable(proc.name);
+        return provider ? { ...proc, provider } : null;
+      })
+      .filter(Boolean) as Array<SystemProcessInfo & { provider: ManagedProcessProvider }>;
+
+    const trackedTaskByPid = new Map<number, string>();
+    for (const [taskId, child] of activeProcesses.entries()) {
+      const pid = Number(child?.pid ?? 0);
+      if (Number.isFinite(pid) && pid > 0) trackedTaskByPid.set(pid, taskId);
+    }
+
+    const trackedTaskIds = Array.from(new Set(Array.from(trackedTaskByPid.values())));
+    const taskMetaById = new Map<string, {
+      task_id: string;
+      task_title: string | null;
+      task_status: string | null;
+      agent_id: string | null;
+      agent_name: string | null;
+      agent_name_ko: string | null;
+      agent_status: string | null;
+      agent_current_task_id: string | null;
+    }>();
+    for (const taskId of trackedTaskIds) {
+      const meta = db.prepare(`
+        SELECT
+          t.id AS task_id,
+          t.title AS task_title,
+          t.status AS task_status,
+          a.id AS agent_id,
+          a.name AS agent_name,
+          a.name_ko AS agent_name_ko,
+          a.status AS agent_status,
+          a.current_task_id AS agent_current_task_id
+        FROM tasks t
+        LEFT JOIN agents a ON a.current_task_id = t.id
+        WHERE t.id = ?
+      `).get(taskId) as {
+        task_id: string;
+        task_title: string | null;
+        task_status: string | null;
+        agent_id: string | null;
+        agent_name: string | null;
+        agent_name_ko: string | null;
+        agent_status: string | null;
+        agent_current_task_id: string | null;
+      } | undefined;
+      if (meta) taskMetaById.set(taskId, meta);
+    }
+
+    const now = Date.now();
+    const result = cliProcesses.map((proc) => {
+      const trackedTaskId = trackedTaskByPid.get(proc.pid) ?? null;
+      const taskMeta = trackedTaskId ? taskMetaById.get(trackedTaskId) : undefined;
+      const session = trackedTaskId ? taskExecutionSessions.get(trackedTaskId) : undefined;
+      const idleSeconds = session?.lastTouchedAt ? Math.max(0, Math.round((now - session.lastTouchedAt) / 1000)) : null;
+      let isIdle = false;
+      let idleReason = "";
+
+      if (!trackedTaskId) {
+        isIdle = true;
+        idleReason = "untracked_process";
+      } else if (!taskMeta) {
+        isIdle = true;
+        idleReason = "task_missing";
+      } else if (!isTaskExecutionStatus(taskMeta.task_status)) {
+        isIdle = true;
+        idleReason = "task_not_running";
+      } else if (taskMeta.agent_status !== "working" || taskMeta.agent_current_task_id !== trackedTaskId) {
+        isIdle = true;
+        idleReason = "agent_not_working";
+      } else if (!session?.lastTouchedAt) {
+        isIdle = true;
+        idleReason = "no_session_activity";
+      } else if (idleSeconds !== null && idleSeconds >= 300) {
+        isIdle = true;
+        idleReason = "inactive_over_5m";
+      }
+
+      return {
+        pid: proc.pid,
+        ppid: proc.ppid,
+        provider: proc.provider,
+        executable: proc.name,
+        command: String(proc.command ?? "").slice(0, 1000),
+        is_tracked: Boolean(trackedTaskId),
+        is_idle: isIdle,
+        idle_reason: idleReason || null,
+        task_id: trackedTaskId,
+        task_title: taskMeta?.task_title ?? null,
+        task_status: taskMeta?.task_status ?? null,
+        agent_id: taskMeta?.agent_id ?? null,
+        agent_name: taskMeta?.agent_name ?? null,
+        agent_name_ko: taskMeta?.agent_name_ko ?? null,
+        agent_status: taskMeta?.agent_status ?? null,
+        session_opened_at: session?.openedAt ?? null,
+        last_activity_at: session?.lastTouchedAt ?? null,
+        idle_seconds: idleSeconds,
+      };
+    }).sort((a, b) => {
+      if (a.is_idle !== b.is_idle) return a.is_idle ? -1 : 1;
+      const byProvider = String(a.provider).localeCompare(String(b.provider));
+      if (byProvider !== 0) return byProvider;
+      return a.pid - b.pid;
+    });
+
+    res.json({ ok: true, processes: result });
+  } catch (err) {
+    console.error("[cli-processes]", err);
+    res.status(500).json({ ok: false, error: "Failed to inspect CLI processes" });
+  }
+});
+
+app.delete("/api/agents/cli-processes/:pid", (req, res) => {
+  const pid = Number.parseInt(String(req.params.pid), 10);
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return res.status(400).json({ ok: false, error: "invalid_pid" });
+  }
+  if (pid === process.pid) {
+    return res.status(400).json({ ok: false, error: "cannot_kill_server_process" });
+  }
+
+  let trackedTaskId: string | null = null;
+  for (const [taskId, child] of activeProcesses.entries()) {
+    if (Number(child?.pid ?? 0) === pid) {
+      trackedTaskId = taskId;
+      break;
+    }
+  }
+
+  try {
+    killPidTree(pid);
+  } catch {
+    // best effort
+  }
+
+  if (trackedTaskId) {
+    stopRequestedTasks.add(trackedTaskId);
+    stopRequestModeByTask.set(trackedTaskId, "cancel");
+    stopProgressTimer(trackedTaskId);
+    endTaskExecutionSession(trackedTaskId, "cli_process_killed");
+    clearTaskWorkflowState(trackedTaskId);
+    activeProcesses.delete(trackedTaskId);
+
+    const task = db.prepare("SELECT id, title, status FROM tasks WHERE id = ?").get(trackedTaskId) as {
+      id: string;
+      title: string;
+      status: string;
+    } | undefined;
+    if (task) {
+      appendTaskLog(trackedTaskId, "system", `CLI process force-killed from inspector (pid=${pid})`);
+      const normalizedStatus = String(task.status ?? "").toLowerCase();
+      if (normalizedStatus !== "done" && normalizedStatus !== "cancelled" && normalizedStatus !== "pending" && normalizedStatus !== "inbox") {
+        db.prepare("UPDATE tasks SET status = 'cancelled', updated_at = ? WHERE id = ?").run(nowMs(), trackedTaskId);
+      }
+      const updatedTask = db.prepare("SELECT * FROM tasks WHERE id = ?").get(trackedTaskId);
+      broadcast("task_update", updatedTask);
+    }
+
+    const linkedAgents = db.prepare("SELECT id FROM agents WHERE current_task_id = ?").all(trackedTaskId) as Array<{ id: string }>;
+    db.prepare("UPDATE agents SET status = 'idle', current_task_id = NULL WHERE current_task_id = ?").run(trackedTaskId);
+    for (const linked of linkedAgents) {
+      const updatedAgent = db.prepare("SELECT * FROM agents WHERE id = ?").get(linked.id);
+      if (updatedAgent) broadcast("agent_status", updatedAgent);
+    }
+  }
+
+  res.json({ ok: true, pid, tracked_task_id: trackedTaskId });
 });
 
 app.get("/api/agents/:id", (req, res) => {
@@ -693,6 +1164,7 @@ app.get("/api/tasks", (req, res) => {
   const statusFilter = firstQueryValue(req.query.status);
   const deptFilter = firstQueryValue(req.query.department_id);
   const agentFilter = firstQueryValue(req.query.agent_id);
+  const projectFilter = firstQueryValue(req.query.project_id);
 
   const conditions: string[] = [];
   const params: unknown[] = [];
@@ -708,6 +1180,10 @@ app.get("/api/tasks", (req, res) => {
   if (agentFilter) {
     conditions.push("t.assigned_agent_id = ?");
     params.push(agentFilter);
+  }
+  if (projectFilter) {
+    conditions.push("t.project_id = ?");
+    params.push(projectFilter);
   }
 
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
@@ -747,11 +1223,14 @@ app.get("/api/tasks", (req, res) => {
       a.avatar_emoji AS agent_avatar,
       d.name AS department_name,
       d.icon AS department_icon,
+      p.name AS project_name,
+      p.core_goal AS project_core_goal,
       ${subtaskTotalExpr} AS subtask_total,
       ${subtaskDoneExpr} AS subtask_done
     FROM tasks t
     LEFT JOIN agents a ON t.assigned_agent_id = a.id
     LEFT JOIN departments d ON t.department_id = d.id
+    LEFT JOIN projects p ON t.project_id = p.id
     ${where}
     ORDER BY t.priority DESC, t.updated_at DESC
   `).all(...(params as SQLInputValue[]));
@@ -769,22 +1248,54 @@ app.post("/api/tasks", (req, res) => {
     return res.status(400).json({ error: "title_required" });
   }
 
+  const requestedProjectId = normalizeTextField(body.project_id);
+  let resolvedProjectId: string | null = null;
+  let resolvedProjectPath = normalizeTextField(body.project_path);
+  if (requestedProjectId) {
+    const project = db.prepare("SELECT id, project_path FROM projects WHERE id = ?").get(requestedProjectId) as {
+      id: string;
+      project_path: string;
+    } | undefined;
+    if (!project) return res.status(400).json({ error: "project_not_found" });
+    resolvedProjectId = project.id;
+    if (!resolvedProjectPath) resolvedProjectPath = normalizeTextField(project.project_path);
+  }
+
   db.prepare(`
-    INSERT INTO tasks (id, title, description, department_id, assigned_agent_id, status, priority, task_type, project_path, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO tasks (id, title, description, department_id, assigned_agent_id, project_id, status, priority, task_type, project_path, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     title,
     body.description ?? null,
     body.department_id ?? null,
     body.assigned_agent_id ?? null,
+    resolvedProjectId,
     body.status ?? "inbox",
     body.priority ?? 0,
     body.task_type ?? "general",
-    body.project_path ?? null,
+    resolvedProjectPath,
     t,
     t,
   );
+  recordTaskCreationAudit({
+    taskId: id,
+    taskTitle: title,
+    taskStatus: String(body.status ?? "inbox"),
+    departmentId: typeof body.department_id === "string" ? body.department_id : null,
+    assignedAgentId: typeof body.assigned_agent_id === "string" ? body.assigned_agent_id : null,
+    taskType: typeof body.task_type === "string" ? body.task_type : "general",
+    projectPath: resolvedProjectPath,
+    trigger: "api.tasks.create",
+    triggerDetail: "POST /api/tasks",
+    actorType: "api_client",
+    req,
+    body: typeof body === "object" && body ? body as Record<string, unknown> : null,
+  });
+
+  if (resolvedProjectId) {
+    db.prepare("UPDATE projects SET last_used_at = ?, updated_at = ? WHERE id = ?").run(t, t, resolvedProjectId);
+  }
 
   appendTaskLog(id, "system", `Task created: ${title}`);
 
@@ -832,11 +1343,14 @@ app.get("/api/tasks/:id", (req, res) => {
       a.cli_provider AS agent_provider,
       d.name AS department_name,
       d.icon AS department_icon,
+      p.name AS project_name,
+      p.core_goal AS project_core_goal,
       ${subtaskTotalExpr} AS subtask_total,
       ${subtaskDoneExpr} AS subtask_done
     FROM tasks t
     LEFT JOIN agents a ON t.assigned_agent_id = a.id
     LEFT JOIN departments d ON t.department_id = d.id
+    LEFT JOIN projects p ON t.project_id = p.id
     WHERE t.id = ?
   `).get(id);
   if (!task) return res.status(404).json({ error: "not_found" });
@@ -887,12 +1401,35 @@ app.patch("/api/tasks/:id", (req, res) => {
   ];
 
   const updates: string[] = ["updated_at = ?"];
-  const params: unknown[] = [nowMs()];
+  const updateTs = nowMs();
+  const params: unknown[] = [updateTs];
+  let touchedProjectId: string | null = null;
 
   for (const field of allowedFields) {
     if (field in body) {
       updates.push(`${field} = ?`);
       params.push(body[field]);
+    }
+  }
+
+  if ("project_id" in body) {
+    const requestedProjectId = normalizeTextField(body.project_id);
+    if (!requestedProjectId) {
+      updates.push("project_id = ?");
+      params.push(null);
+    } else {
+      const project = db.prepare("SELECT id, project_path FROM projects WHERE id = ?").get(requestedProjectId) as {
+        id: string;
+        project_path: string;
+      } | undefined;
+      if (!project) return res.status(400).json({ error: "project_not_found" });
+      updates.push("project_id = ?");
+      params.push(project.id);
+      touchedProjectId = project.id;
+      if (!("project_path" in body)) {
+        updates.push("project_path = ?");
+        params.push(project.project_path);
+      }
     }
   }
 
@@ -908,8 +1445,14 @@ app.patch("/api/tasks/:id", (req, res) => {
 
   params.push(id);
   db.prepare(`UPDATE tasks SET ${updates.join(", ")} WHERE id = ?`).run(...(params as SQLInputValue[]));
+  if (touchedProjectId) {
+    db.prepare("UPDATE projects SET last_used_at = ?, updated_at = ? WHERE id = ?").run(updateTs, updateTs, touchedProjectId);
+  }
 
   const nextStatus = typeof body.status === "string" ? body.status : null;
+  if (nextStatus) {
+    setTaskCreationAuditCompletion(id, nextStatus === "done");
+  }
   if (nextStatus && (nextStatus === "cancelled" || nextStatus === "pending" || nextStatus === "done" || nextStatus === "inbox")) {
     clearTaskWorkflowState(id);
     if (nextStatus === "done" || nextStatus === "cancelled") {

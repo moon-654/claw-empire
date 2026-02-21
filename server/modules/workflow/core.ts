@@ -1,6 +1,7 @@
 // @ts-nocheck
 
 import type { RuntimeContext, WorkflowCoreExports } from "../../types/runtime-context.ts";
+import { isLang, type Lang } from "../../types/lang.ts";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -19,6 +20,11 @@ import {
 import { BUILTIN_GOOGLE_CLIENT_ID, BUILTIN_GOOGLE_CLIENT_SECRET, decryptSecret, encryptSecret } from "../../oauth/helpers.ts";
 import { notifyTaskStatus } from "../../gateway/client.ts";
 import { createWsHub } from "../../ws/hub.ts";
+import {
+  compactMeetingPromptText,
+  formatMeetingTranscriptForPrompt,
+  type MeetingTranscriptLine,
+} from "./meeting-prompt-utils.ts";
 
 export function initializeWorkflowPartA(ctx: RuntimeContext): WorkflowCoreExports {
   const __ctx: RuntimeContext = ctx;
@@ -1026,7 +1032,10 @@ function extractLatestProjectMemoBlock(description: string, maxChars = 1600): st
   const marker = "[PROJECT MEMO]";
   const idx = description.lastIndexOf(marker);
   if (idx < 0) return "";
-  const block = description.slice(idx).trim();
+  const block = description.slice(idx)
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
   if (!block) return "";
   return block.length > maxChars ? `...${block.slice(-maxChars)}` : block;
 }
@@ -1088,7 +1097,7 @@ function getTaskContinuationContext(taskId: string): string {
     .reverse()
     .slice(0, 4);
 
-  const memoBlock = extractLatestProjectMemoBlock(taskRow?.description ?? "", 1400);
+  const memoBlock = extractLatestProjectMemoBlock(taskRow?.description ?? "", 900);
   const normalizedResult = normalizeStreamChunk(taskRow?.result ?? "", { dropCliNoise: true }).trim();
   const resultTail = normalizedResult.length > 900
     ? `...${normalizedResult.slice(-900)}`
@@ -1146,6 +1155,12 @@ interface MeetingPromptOptions {
   turnObjective: string;
   stanceHint?: string;
   lang: string;
+}
+
+function normalizeMeetingLang(value: unknown): Lang {
+  if (isLang(value)) return value;
+  const preferred = getPreferredLanguage();
+  return isLang(preferred) ? preferred : "ko";
 }
 
 function sleepMs(ms: number): Promise<void> {
@@ -1322,6 +1337,37 @@ const MEETING_BUBBLE_EMPTY = {
   zh: ["稍后分享意见。"],
 };
 
+// 320 chars is the minimum viable task context (roughly one short paragraph).
+const MEETING_PROMPT_TASK_CONTEXT_MAX_CHARS = Math.max(
+  320,
+  readNonNegativeIntEnv("MEETING_PROMPT_TASK_CONTEXT_MAX_CHARS", 1200),
+);
+// Keep at least 4 turns so stance changes can still be inferred.
+const MEETING_TRANSCRIPT_MAX_TURNS = Math.max(
+  4,
+  readNonNegativeIntEnv("MEETING_TRANSCRIPT_MAX_TURNS", 20),
+);
+// 72 chars keeps one concise sentence with role/speaker metadata still readable.
+const MEETING_TRANSCRIPT_LINE_MAX_CHARS = Math.max(
+  72,
+  readNonNegativeIntEnv("MEETING_TRANSCRIPT_LINE_MAX_CHARS", 180),
+);
+// 720 chars ensures transcript block remains useful while controlling token drift.
+const MEETING_TRANSCRIPT_TOTAL_MAX_CHARS = Math.max(
+  720,
+  readNonNegativeIntEnv("MEETING_TRANSCRIPT_TOTAL_MAX_CHARS", 2400),
+);
+
+/**
+ * Semantic wrapper for meeting-specific task/context compaction.
+ *
+ * Keeping this indirection gives us one stable hook if meeting prompts ever need
+ * extra pre/post processing beyond generic text compaction.
+ */
+function compactForMeetingPrompt(text: string, maxChars: number): string {
+  return compactMeetingPromptText(text, maxChars);
+}
+
 function summarizeForMeetingBubble(text: string, maxChars = 96, lang: Lang = getPreferredLanguage()): string {
   const cleaned = normalizeConversationReply(text, maxChars + 24)
     .replace(/\s+/g, " ")
@@ -1395,27 +1441,49 @@ function findLatestTranscriptContentByAgent(
   return "";
 }
 
-function formatMeetingTranscript(transcript: MeetingTranscriptEntry[]): string {
-  if (transcript.length === 0) return "(none)";
-  return transcript
-    .map((line, idx) => `${idx + 1}. ${line.speaker} (${line.department} ${line.role}): ${line.content}`)
-    .join("\n");
+function compactTaskDescriptionForMeeting(taskDescription: string | null): string {
+  if (!taskDescription) return "";
+  const marker = "[PROJECT MEMO]";
+  const markerIdx = taskDescription.indexOf(marker);
+  const base = markerIdx >= 0 ? taskDescription.slice(0, markerIdx) : taskDescription;
+  return compactForMeetingPrompt(base, MEETING_PROMPT_TASK_CONTEXT_MAX_CHARS);
+}
+
+function formatMeetingTranscript(
+  transcript: MeetingTranscriptEntry[],
+  lang: Lang = getPreferredLanguage(),
+): string {
+  const lines: MeetingTranscriptLine[] = transcript.map((row) => ({
+    speaker: row.speaker,
+    department: row.department,
+    role: row.role,
+    content: row.content,
+  }));
+
+  return formatMeetingTranscriptForPrompt(lines, {
+    maxTurns: MEETING_TRANSCRIPT_MAX_TURNS,
+    maxLineChars: MEETING_TRANSCRIPT_LINE_MAX_CHARS,
+    maxTotalChars: MEETING_TRANSCRIPT_TOTAL_MAX_CHARS,
+    summarize: (text, maxChars) => summarizeForMeetingBubble(text, maxChars, lang),
+  });
 }
 
 function buildMeetingPrompt(agent: AgentRow, opts: MeetingPromptOptions): string {
+  const lang = normalizeMeetingLang(opts.lang);
   const deptName = getDeptName(agent.department_id ?? "");
-  const role = getRoleLabel(agent.role, opts.lang as Lang);
+  const role = getRoleLabel(agent.role, lang);
   const deptConstraint = agent.department_id ? getDeptRoleConstraint(agent.department_id, deptName) : "";
   const recentCtx = getRecentConversationContext(agent.id, 8);
   const meetingLabel = opts.meetingType === "planned" ? "Planned Approval" : "Review Consensus";
+  const compactTaskContext = compactTaskDescriptionForMeeting(opts.taskDescription);
   return [
     `[CEO OFFICE ${meetingLabel}]`,
     `Task: ${opts.taskTitle}`,
-    opts.taskDescription ? `Task context: ${opts.taskDescription}` : "",
+    compactTaskContext ? `Task context: ${compactTaskContext}` : "",
     `Round: ${opts.round}`,
-    `You are ${getAgentDisplayName(agent, opts.lang)} (${deptName} ${role}).`,
+    `You are ${getAgentDisplayName(agent, lang)} (${deptName} ${role}).`,
     deptConstraint,
-    localeInstruction(opts.lang),
+    localeInstruction(lang),
     "Output rules:",
     "- Return one natural chat message only (no JSON, no markdown).",
     "- Keep it concise: 1-3 sentences.",
@@ -1424,7 +1492,7 @@ function buildMeetingPrompt(agent: AgentRow, opts: MeetingPromptOptions): string
     `Current turn objective: ${opts.turnObjective}`,
     "",
     "[Meeting transcript so far]",
-    formatMeetingTranscript(opts.transcript),
+    formatMeetingTranscript(opts.transcript, lang),
     recentCtx,
   ].filter(Boolean).join("\n");
 }

@@ -117,8 +117,9 @@ function readStoredRoomThemes(): { themes: RoomThemeMap; hasStored: boolean } {
 }
 
 function appendCapped<T>(prev: T[], item: T, max: number): T[] {
-  if (prev.length < max) return [...prev, item];
-  return [...prev.slice(prev.length - max + 1), item];
+  const next = prev.length >= max ? prev.slice(prev.length - max + 1) : prev.slice();
+  next.push(item);
+  return next;
 }
 
 function mergeSettingsWithDefaults(
@@ -659,12 +660,23 @@ export default function App() {
     return () => unsubs.forEach((fn) => fn());
   }, [on, scheduleLiveSync]);
 
-  // Polling for fresh data every 5 seconds
+  // Polling for fresh data every 5 seconds (paused when tab is hidden)
   useEffect(() => {
-    const timer = setInterval(() => {
-      scheduleLiveSync(0);
-    }, 5000);
-    return () => clearInterval(timer);
+    let timer: ReturnType<typeof setInterval>;
+    function start() { timer = setInterval(() => scheduleLiveSync(0), 5000); }
+    function handleVisibility() {
+      clearInterval(timer);
+      if (!document.hidden) {
+        scheduleLiveSync(0);
+        start();
+      }
+    }
+    start();
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
   }, [scheduleLiveSync]);
 
   const activeMeetingTaskId = useMemo(() => {
@@ -686,11 +698,18 @@ export default function App() {
   }, [meetingPresence]);
 
   // Handlers
+  type ProjectMetaPayload = {
+    project_id?: string;
+    project_path?: string;
+    project_context?: string;
+  };
+
   async function handleSendMessage(
     content: string,
     receiverType: "agent" | "department" | "all",
     receiverId?: string,
-    messageType?: string
+    messageType?: string,
+    projectMeta?: ProjectMetaPayload
   ) {
     try {
       await api.sendMessage({
@@ -698,6 +717,9 @@ export default function App() {
         receiver_id: receiverId,
         content,
         message_type: (messageType as "chat" | "task_assign" | "report") || "chat",
+        project_id: projectMeta?.project_id,
+        project_path: projectMeta?.project_path,
+        project_context: projectMeta?.project_context,
       });
       // Refresh messages
       const msgs = await api.getMessages({
@@ -719,9 +741,18 @@ export default function App() {
     }
   }
 
-  async function handleSendDirective(content: string) {
+  async function handleSendDirective(content: string, projectMeta?: ProjectMetaPayload) {
     try {
-      await api.sendDirective(content);
+      if (projectMeta?.project_id || projectMeta?.project_path || projectMeta?.project_context) {
+        await api.sendDirectiveWithProject({
+          content,
+          project_id: projectMeta.project_id,
+          project_path: projectMeta.project_path,
+          project_context: projectMeta.project_context,
+        });
+      } else {
+        await api.sendDirective(content);
+      }
     } catch (e) {
       console.error("Directive failed:", e);
     }
@@ -733,6 +764,7 @@ export default function App() {
     department_id?: string;
     task_type?: string;
     priority?: number;
+    assigned_agent_id?: string;
   }) {
     try {
       await api.createTask(input as Parameters<typeof api.createTask>[0]);
@@ -946,6 +978,12 @@ export default function App() {
     ja: "レポート",
     zh: "报告",
   })}`;
+  const tasksPrimaryLabel = pickLang(uiLanguage, {
+    ko: "업무",
+    en: "Tasks",
+    ja: "タスク",
+    zh: "任务",
+  });
   const agentStatusLabel = pickLang(uiLanguage, {
     ko: "에이전트",
     en: "Agents",
@@ -1034,7 +1072,7 @@ export default function App() {
 
   return (
     <I18nProvider language={uiLanguage}>
-      <div className="flex h-[100dvh] min-h-[100dvh] overflow-hidden" style={{ background: 'var(--th-bg-primary)' }}>
+      <div className="app-shell flex h-[100dvh] min-h-[100dvh] overflow-hidden">
         {/* Desktop Sidebar */}
         <div className="hidden lg:flex lg:flex-shrink-0">
           <Sidebar
@@ -1090,15 +1128,23 @@ export default function App() {
             </div>
             <div className="flex items-center gap-2 sm:gap-3">
               <button
+                onClick={() => setView("tasks")}
+                className="header-action-btn header-action-btn-primary"
+                aria-label={tasksPrimaryLabel}
+              >
+                <span className="sm:hidden">📋</span>
+                <span className="hidden sm:inline">📋 {tasksPrimaryLabel}</span>
+              </button>
+              <button
                 onClick={() => setShowAgentStatus(true)}
-                className="rounded-lg border border-blue-500/30 bg-blue-600/20 px-2.5 py-1.5 text-xs text-blue-400 transition-colors hover:bg-blue-600/30 sm:px-3 sm:text-sm"
+                className="header-action-btn header-action-btn-secondary"
               >
                 <span className="sm:hidden">&#x1F6E0;</span>
                 <span className="hidden sm:inline">&#x1F6E0; {agentStatusLabel}</span>
               </button>
               <button
                 onClick={() => setShowReportHistory(true)}
-                className="rounded-lg border border-emerald-500/30 bg-emerald-600/20 px-2.5 py-1.5 text-xs text-emerald-400 transition-colors hover:bg-emerald-600/30 sm:px-3 sm:text-sm"
+                className="header-action-btn header-action-btn-secondary"
               >
                 <span className="sm:hidden">📋</span>
                 <span className="hidden sm:inline">{reportLabel}</span>
@@ -1112,14 +1158,14 @@ export default function App() {
                     .then(setMessages)
                     .catch(console.error);
                 }}
-                className="announcement-topbar-btn rounded-lg border border-amber-500/30 bg-amber-600/20 px-2.5 py-1.5 text-xs text-amber-400 transition-colors hover:bg-amber-600/30 sm:px-3 sm:text-sm"
+                className="header-action-btn header-action-btn-secondary"
               >
                 <span className="sm:hidden">📢</span>
                 <span className="hidden sm:inline">{announcementLabel}</span>
               </button>
               <button
                 onClick={() => setShowRoomManager(true)}
-                className="rounded-lg border border-violet-500/30 bg-violet-600/20 px-2.5 py-1.5 text-xs text-violet-400 transition-colors hover:bg-violet-600/30 sm:px-3 sm:text-sm"
+                className="header-action-btn header-action-btn-secondary"
               >
                 <span className="sm:hidden">🏢</span>
                 <span className="hidden sm:inline">{roomManagerLabel}</span>
@@ -1241,6 +1287,7 @@ export default function App() {
                 agents={agents}
                 tasks={tasks}
                 companyName={settings.companyName}
+                onPrimaryCtaClick={() => setView("tasks")}
               />
             )}
 

@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.1.2-blue" alt="Version" />
+  <img src="https://img.shields.io/badge/version-1.1.3-blue" alt="Version" />
   <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen" alt="Node.js 22+" />
   <img src="https://img.shields.io/badge/license-Apache%202.0-orange" alt="License" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="Platform" />
@@ -20,7 +20,7 @@
 <p align="center">
   <a href="#빠른-시작">빠른 시작</a> &middot;
   <a href="#ai-installation-guide">AI 설치 가이드</a> &middot;
-  <a href="docs/releases/v1.1.2.md">릴리즈 노트</a> &middot;
+  <a href="docs/releases/v1.1.3.md">릴리즈 노트</a> &middot;
   <a href="#openclaw-integration">OpenClaw 연동</a> &middot;
   <a href="#dollar-command-logic">$ 명령 로직</a> &middot;
   <a href="#주요-기능">주요 기능</a> &middot;
@@ -53,16 +53,29 @@ Claw-Empire는 **CLI**, **OAuth**, **직접 API 키** 방식으로 연결된 AI 
 
 ---
 
-## 최신 릴리즈 (v1.1.2)
+## 최신 릴리즈 (v1.1.3)
 
-- **다크/라이트 테마 토글** — 앱 전역 테마 전환과 모드 저장(지속성)을 추가했습니다.
-- **디자인 토큰 통합** — `--th-*` 기반으로 배경/보더/텍스트/모달/패널 스타일을 일관되게 정리했습니다.
-- **오피스 뷰 테마 적응** — 부서/복도/CEO 오피스/휴게실을 라이트·다크 전용 팔레트로 렌더링합니다.
-- **가독성 개선(라이트모드)** — 대시보드/사이드바/터미널의 텍스트 대비를 높여 뿌옇게 보이던 UI를 개선했습니다.
-- **학습 모달/Unlearn 개선** — 문서고 학습 팝업과 학습메모리 Unlearn 영역의 버튼/폰트 대비를 강화했습니다.
-- **언어 유지 안정화** — 서버 재시작 시 자동 언어 재할당 조건을 보강해 언어 초기화 가능성을 줄였습니다.
-- **오피스 이미지 업데이트(문구 기록)** — `Sample_Img/Office.png`는 최신 디자인으로 갱신되었으며, 이번 릴리즈 섹션에는 문구로만 기록했습니다.
-- 상세 문서: [`docs/releases/v1.1.2.md`](docs/releases/v1.1.2.md)
+- **프로젝트 선행 분기 강제** — 채팅에서 업무지시/`$` directive 전송 전, 반드시 기존/신규 프로젝트를 먼저 선택합니다.
+- **기존/신규 프로젝트 플로우 확장** — 기존 프로젝트는 최근 10개(번호/이름)로 선택하고, 신규 프로젝트는 이름/경로/목표를 즉시 등록할 수 있습니다.
+- **프로젝트 관리 기능 강화** — `새 업무` 옆에 프로젝트 관리 진입 버튼을 추가하고, 검색/페이지네이션/CRUD/상세 조회를 통합했습니다.
+- **프로젝트 매핑 이력 조회** — 작업 이력을 루트/하위 task 카드로 묶어 표시하고, 클릭 시 에이전트/팀 보고/문서 원문까지 상세 모달에서 확인할 수 있습니다.
+- **OpenClaw 구버전 차단 강화** — directive 수신 시 최신 AGENTS 규칙 미준수는 기본적으로 `HTTP 428 agent_upgrade_required`로 차단합니다.
+- **설치 안내 payload 확장** — 428 응답에 설치 파일 절대경로, 대상 AGENTS 경로, 추천 명령, 사용자 동의 프롬프트를 포함합니다.
+- **라이트 모드 가시성 개선** — 업무관리 탭의 프로젝트 관리 버튼 대비를 높여 라이트 테마에서 식별성을 개선했습니다.
+- **브라우저 안정성 개선** — Chrome `STATUS_ACCESS_VIOLATION` 크래시 해결: WebSocket broadcast 배치 처리(cli_output/subtask_update), 탭 숨김 시 폴링 중지, Pixi.js GPU 메모리 해제(`destroyNode`), 상태 배열 GC 최적화, ChatPanel 메시지 필터 메모이제이션.
+- **업무 생성 시 담당자 저장 수정** — "새 업무" 모달에서 선택한 에이전트가 이제 정상적으로 저장됩니다(`assigned_agent_id`). 이전에는 할당 정보가 누락되었습니다.
+- **실행 가드 UX 개선** — 담당자 미배정 상태에서 실행 버튼 클릭 시 콘솔 에러 대신, 에이전트 셀렉터에 빨간 테두리 + 흔들림 애니메이션 + "담당자를 배정해주세요!" 인라인 경고를 표시합니다.
+- **헤더 버튼 리디자인** — 대시보드 헤더 액션을 primary(파란 그라데이션 CTA, 업무 탭)와 secondary(중립 스타일, 에이전트/보고서/공지/회의실)로 분리했습니다.
+- **회의 프롬프트 압축 기본값 조정** — 회의 transcript 프롬프트 압축 기본값을 `MEETING_TRANSCRIPT_MAX_TURNS=20`으로 상향하고, 라인/전체 길이 예산을 함께 적용합니다.
+- **첫 실행 `.env` 자동 보강** — `git pull` 이후 첫 `pnpm dev*` / `pnpm start*` 실행 시, `.env`에 누락된 회의 프롬프트 키(`MEETING_PROMPT_TASK_CONTEXT_MAX_CHARS`, `MEETING_TRANSCRIPT_MAX_TURNS`, `MEETING_TRANSCRIPT_LINE_MAX_CHARS`, `MEETING_TRANSCRIPT_TOTAL_MAX_CHARS`)를 자동으로 채웁니다(기존 값은 유지).
+- **출처** — 해당 회의 프롬프트 압축 후속 반영은 `SJY0917032`의 PR #23 제안/논의를 기반으로 했습니다.
+- **Active Agents 프로세스 확인 메뉴 추가** — Active Agents에 `Script` / `Idle CLI` 탭을 추가해 비정상 종료되었거나 남아 있는 스크립트/백그라운드 CLI 프로세스를 확인할 수 있습니다.
+
+  <p align="center">
+    <img src="Sample_Img/Script_view.png" alt="Active Agents Script View" width="49%" />
+    <img src="Sample_Img/Idle_CLI_view.png" alt="Active Agents Idle CLI View" width="49%" />
+  </p>
+- 상세 문서: [`docs/releases/v1.1.3.md`](docs/releases/v1.1.3.md)
 
 ---
 
@@ -299,7 +312,7 @@ curl -s http://127.0.0.1:8790/api/gateway/targets
 curl -X POST http://127.0.0.1:8790/api/inbox \
   -H "content-type: application/json" \
   -H "x-inbox-secret: $INBOX_WEBHOOK_SECRET" \
-  -d '{"source":"telegram","author":"ceo","text":"$README v1.1.2 inbox 점검","skipPlannedMeeting":true}'
+  -d '{"source":"telegram","author":"ceo","text":"$README v1.1.3 inbox 점검","skipPlannedMeeting":true}'
 ```
 
 예상 응답:
@@ -486,7 +499,7 @@ curl -s http://127.0.0.1:8790/api/gateway/targets
 curl -X POST http://127.0.0.1:8790/api/inbox \
   -H "content-type: application/json" \
   -H "x-inbox-secret: $INBOX_WEBHOOK_SECRET" \
-  -d '{"source":"telegram","author":"ceo","text":"$금요일까지 QA 승인 포함 v0.2 배포 준비","project_path":"/Users/me/Projects/climpire"}'
+  -d '{"source":"telegram","author":"ceo","text":"$금요일까지 QA 승인 포함 v0.2 배포 준비","project_path":"/workspace/my-project"}'
 ```
 
 회의 생략:
@@ -553,7 +566,7 @@ pnpm start              # 빌드된 서버 실행
 curl -fsS http://127.0.0.1:8790/healthz
 ```
 
-### 통신 QA 점검 (v1.1.2)
+### 통신 QA 점검 (v1.1.3)
 
 ```bash
 # 개별 점검

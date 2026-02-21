@@ -2,6 +2,7 @@ import { useState, useMemo, useCallback, useEffect } from 'react';
 import type { Task, Agent, Department, TaskStatus, TaskType, SubTask } from '../types';
 import AgentAvatar from './AgentAvatar';
 import AgentSelect from './AgentSelect';
+import ProjectManagerModal from './ProjectManagerModal';
 import { getTaskDiff, mergeTask, discardTask, type TaskDiffResult } from '../api';
 
 interface TaskBoardProps {
@@ -15,6 +16,7 @@ interface TaskBoardProps {
     department_id?: string;
     task_type?: string;
     priority?: number;
+    assigned_agent_id?: string;
   }) => void;
   onUpdateTask: (id: string, data: Partial<Task>) => void;
   onDeleteTask: (id: string) => void;
@@ -296,30 +298,14 @@ function CreateModal({ agents, departments, onClose, onCreate, onAssign }: Creat
     e.preventDefault();
     if (!title.trim()) return;
 
-    // We'll create the task first then assign if needed.
-    // Since onCreate doesn't return the task id, we rely on the parent
-    // calling onAssignTask after the task appears. For now, we pass
-    // a combined approach: create with the data and let parent handle assign.
     onCreate({
       title: title.trim(),
       description: description.trim() || undefined,
       department_id: departmentId || undefined,
       task_type: taskType,
       priority,
+      assigned_agent_id: assignAgentId || undefined,
     });
-
-    // Note: assigning requires the task id which we don't have yet.
-    // The parent component should handle this after task creation.
-    // We surface the assignAgentId via a custom event pattern below.
-    if (assignAgentId) {
-      // Store for parent to pick up — simple approach: set a data attr on the form
-      // In practice, onCreateTask should accept assigned_agent_id too,
-      // or the parent should handle post-creation assignment.
-      // We call onAssign with a placeholder id; the parent must handle timing.
-      // This is a best-effort call with a temporary empty string —
-      // in a real setup, the API would return the new task id.
-      // For now we skip and let the user assign from the card.
-    }
 
     onClose();
   }
@@ -759,6 +745,7 @@ function TaskCard({
   const [expanded, setExpanded] = useState(false);
   const [showDiff, setShowDiff] = useState(false);
   const [showSubtasks, setShowSubtasks] = useState(false);
+  const [agentWarning, setAgentWarning] = useState(false);
 
   const assignedAgent = task.assigned_agent ?? agents.find((a) => a.id === task.assigned_agent_id);
   const department = departments.find((d) => d.id === task.department_id);
@@ -854,11 +841,12 @@ function TaskCard({
       </div>
 
       {/* Assign agent dropdown */}
-      <div className="mb-3">
+      <div className={`mb-3 rounded-lg transition-all ${agentWarning ? 'ring-2 ring-red-500 animate-[shake_0.4s_ease-in-out]' : ''}`}>
         <AgentSelect
           agents={agents}
           value={task.assigned_agent_id ?? ''}
           onChange={(agentId) => {
+            setAgentWarning(false);
             if (agentId) {
               onAssignTask(task.id, agentId);
             } else {
@@ -866,6 +854,11 @@ function TaskCard({
             }
           }}
         />
+        {agentWarning && (
+          <p className="mt-1 text-xs font-medium text-red-400 animate-[shake_0.4s_ease-in-out]">
+            {t({ ko: '담당자를 배정해주세요!', en: 'Please assign an agent!', ja: '担当者を割り当ててください！', zh: '请分配负责人！' })}
+          </p>
+        )}
       </div>
 
       {/* SubTask progress bar */}
@@ -931,7 +924,14 @@ function TaskCard({
       <div className="flex flex-wrap items-center gap-1.5">
         {canRun && (
           <button
-            onClick={() => onRunTask(task.id)}
+            onClick={() => {
+              if (!task.assigned_agent_id) {
+                setAgentWarning(true);
+                setTimeout(() => setAgentWarning(false), 3000);
+                return;
+              }
+              onRunTask(task.id);
+            }}
             title={t({ ko: '작업 실행', en: 'Run task', ja: 'タスク実行', zh: '运行任务' })}
             className="flex flex-1 items-center justify-center gap-1 rounded-lg bg-green-700 px-2 py-1.5 text-xs font-medium text-white transition hover:bg-green-600"
           >
@@ -1298,6 +1298,7 @@ export function TaskBoard({
 }: TaskBoardProps) {
   const { t } = useI18n();
   const [showCreate, setShowCreate] = useState(false);
+  const [showProjectManager, setShowProjectManager] = useState(false);
   const [showBulkHideModal, setShowBulkHideModal] = useState(false);
   const [filterDept, setFilterDept] = useState('');
   const [filterAgent, setFilterAgent] = useState('');
@@ -1414,7 +1415,7 @@ export function TaskBoard({
   }, [tasks, hiddenTaskIds]);
 
   return (
-    <div className="flex h-full flex-col gap-4 bg-slate-950 p-3 sm:p-4">
+    <div className="taskboard-shell flex h-full flex-col gap-4 bg-slate-950 p-3 sm:p-4">
       {/* Top bar */}
       <div className="flex flex-wrap items-center gap-3">
         <h1 className="text-xl font-bold text-white">{t({ ko: '업무 보드', en: 'Task Board', ja: 'タスクボード', zh: '任务看板' })}</h1>
@@ -1490,6 +1491,12 @@ export function TaskBoard({
             🙈 {t({ ko: '숨김', en: 'Hide', ja: '非表示', zh: '隐藏' })}
           </button>
           <button
+            onClick={() => setShowProjectManager(true)}
+            className="taskboard-project-manage-btn rounded-lg border px-3 py-1.5 text-xs font-semibold transition"
+          >
+            🗂 {t({ ko: '프로젝트 관리', en: 'Project Manager', ja: 'プロジェクト管理', zh: '项目管理' })}
+          </button>
+          <button
             onClick={() => setShowCreate(true)}
             className="rounded-lg bg-blue-600 px-4 py-1.5 text-sm font-semibold text-white shadow transition hover:bg-blue-500 active:scale-95"
           >
@@ -1519,7 +1526,7 @@ export function TaskBoard({
           return (
             <div
               key={col.status}
-              className={`flex w-full flex-col rounded-xl border sm:w-72 sm:flex-shrink-0 ${col.borderColor} bg-slate-900`}
+              className={`taskboard-column flex w-full flex-col rounded-xl border sm:w-72 sm:flex-shrink-0 ${col.borderColor} bg-slate-900`}
             >
               {/* Column header */}
               <div
@@ -1583,6 +1590,14 @@ export function TaskBoard({
           onClose={() => setShowCreate(false)}
           onCreate={onCreateTask}
           onAssign={onAssignTask}
+        />
+      )}
+
+      {/* Project manager modal */}
+      {showProjectManager && (
+        <ProjectManagerModal
+          agents={agents}
+          onClose={() => setShowProjectManager(false)}
         />
       )}
 
