@@ -27,6 +27,7 @@ interface TaskBoardProps {
   onResumeTask?: (id: string) => void;
   onOpenTerminal?: (taskId: string) => void;
   onOpenMeetingMinutes?: (taskId: string) => void;
+  onOpenAgentChat?: (agent: Agent) => void;
   onMergeTask?: (id: string) => void;
   onDiscardTask?: (id: string) => void;
 }
@@ -711,6 +712,7 @@ interface TaskCardProps {
   onResumeTask?: (id: string) => void;
   onOpenTerminal?: (taskId: string) => void;
   onOpenMeetingMinutes?: (taskId: string) => void;
+  onOpenAgentChat?: (agent: Agent) => void;
   onMergeTask?: (id: string) => void;
   onDiscardTask?: (id: string) => void;
   onHideTask?: (id: string) => void;
@@ -739,6 +741,7 @@ function TaskCard({
   onResumeTask,
   onOpenTerminal,
   onOpenMeetingMinutes,
+  onOpenAgentChat,
   onHideTask,
   onUnhideTask,
 }: TaskCardProps) {
@@ -1006,6 +1009,15 @@ function TaskCard({
             className="flex items-center justify-center rounded-lg bg-cyan-800/70 px-2 py-1.5 text-xs text-cyan-200 transition hover:bg-cyan-700 hover:text-white"
           >
             📝
+          </button>
+        )}
+        {task.status === 'review' && assignedAgent && onOpenAgentChat && (
+          <button
+            onClick={() => onOpenAgentChat(assignedAgent)}
+            title={t({ ko: '담당자 채팅 열기', en: 'Open assignee chat', ja: '担当者チャットを開く', zh: '打开负责人聊天' })}
+            className="flex items-center justify-center gap-1 rounded-lg bg-emerald-800 px-2 py-1.5 text-xs font-medium text-emerald-200 transition hover:bg-emerald-700"
+          >
+            💬
           </button>
         )}
         {task.status === 'review' && (
@@ -1296,6 +1308,7 @@ export function TaskBoard({
   onResumeTask,
   onOpenTerminal,
   onOpenMeetingMinutes,
+  onOpenAgentChat,
   onMergeTask,
   onDiscardTask,
 }: TaskBoardProps) {
@@ -1626,6 +1639,7 @@ export function TaskBoard({
                       onResumeTask={onResumeTask}
                       onOpenTerminal={onOpenTerminal}
                       onOpenMeetingMinutes={onOpenMeetingMinutes}
+                      onOpenAgentChat={onOpenAgentChat}
                       onMergeTask={onMergeTask}
                       onDiscardTask={onDiscardTask}
                       onHideTask={hideTask}
