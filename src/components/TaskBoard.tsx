@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useEffect } from 'react';
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import type { Task, Agent, Department, TaskStatus, TaskType, SubTask } from '../types';
 import AgentAvatar from './AgentAvatar';
 import AgentSelect from './AgentSelect';
@@ -1297,6 +1297,7 @@ export function TaskBoard({
   onDiscardTask,
 }: TaskBoardProps) {
   const { t } = useI18n();
+  const kanbanScrollRef = useRef<HTMLDivElement>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [showProjectManager, setShowProjectManager] = useState(false);
   const [showBulkHideModal, setShowBulkHideModal] = useState(false);
@@ -1305,6 +1306,8 @@ export function TaskBoard({
   const [filterType, setFilterType] = useState('');
   const [search, setSearch] = useState('');
   const [showAllTasks, setShowAllTasks] = useState(false);
+  const [kanbanScrollLeft, setKanbanScrollLeft] = useState(0);
+  const [kanbanScrollMetrics, setKanbanScrollMetrics] = useState({ scrollWidth: 0, clientWidth: 0 });
   const [hiddenTaskIds, setHiddenTaskIds] = useState<Set<string>>(
     () => new Set(loadHiddenTaskIds()),
   );
@@ -1413,6 +1416,53 @@ export function TaskBoard({
     }
     return count;
   }, [tasks, hiddenTaskIds]);
+  const maxKanbanScrollLeft = Math.max(0, kanbanScrollMetrics.scrollWidth - kanbanScrollMetrics.clientWidth);
+  const hasKanbanHorizontalOverflow = kanbanScrollMetrics.scrollWidth - kanbanScrollMetrics.clientWidth > 2;
+
+  const syncKanbanMetrics = useCallback(() => {
+    const el = kanbanScrollRef.current;
+    if (!el) return;
+    const next = {
+      scrollWidth: Math.ceil(el.scrollWidth),
+      clientWidth: Math.ceil(el.clientWidth),
+    };
+    const maxScrollLeft = Math.max(0, next.scrollWidth - next.clientWidth);
+    if (el.scrollLeft > maxScrollLeft) {
+      el.scrollLeft = maxScrollLeft;
+    }
+    setKanbanScrollMetrics((prev) => (
+      prev.scrollWidth === next.scrollWidth && prev.clientWidth === next.clientWidth ? prev : next
+    ));
+    const currentScrollLeft = Math.round(el.scrollLeft);
+    setKanbanScrollLeft((prev) => (prev === currentScrollLeft ? prev : currentScrollLeft));
+  }, []);
+
+  useEffect(() => {
+    const raf = requestAnimationFrame(syncKanbanMetrics);
+    return () => cancelAnimationFrame(raf);
+  }, [syncKanbanMetrics, filteredTasks.length]);
+
+  useEffect(() => {
+    const el = kanbanScrollRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => syncKanbanMetrics());
+    observer.observe(el);
+    for (const child of Array.from(el.children)) observer.observe(child);
+    return () => observer.disconnect();
+  }, [syncKanbanMetrics, filteredTasks.length]);
+
+  const handleKanbanScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
+    const next = Math.round(event.currentTarget.scrollLeft);
+    setKanbanScrollLeft((prev) => (prev === next ? prev : next));
+  }, []);
+
+  const handleBottomSliderChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    const next = Number(event.currentTarget.value);
+    if (!Number.isFinite(next)) return;
+    const kanban = kanbanScrollRef.current;
+    if (kanban) kanban.scrollLeft = next;
+    setKanbanScrollLeft(next);
+  }, []);
 
   return (
     <div className="taskboard-shell flex h-full flex-col gap-4 bg-slate-950 p-3 sm:p-4">
@@ -1520,7 +1570,11 @@ export function TaskBoard({
       />
 
       {/* Kanban board */}
-      <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pb-2 sm:flex-row sm:overflow-x-auto sm:overflow-y-hidden">
+      <div
+        ref={kanbanScrollRef}
+        onScroll={handleKanbanScroll}
+        className="taskboard-kanban-scroll flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pb-2 sm:flex-row sm:overflow-x-scroll sm:overflow-y-hidden sm:pb-3"
+      >
         {COLUMNS.map((col) => {
           const colTasks = tasksByStatus[col.status] ?? [];
           return (
@@ -1580,6 +1634,19 @@ export function TaskBoard({
             </div>
           );
         })}
+      </div>
+      <div className={`taskboard-bottom-scroll ${hasKanbanHorizontalOverflow ? '' : 'taskboard-bottom-scroll-disabled'}`}>
+        <input
+          type="range"
+          min={0}
+          max={maxKanbanScrollLeft}
+          step={1}
+          value={Math.min(kanbanScrollLeft, maxKanbanScrollLeft)}
+          onChange={handleBottomSliderChange}
+          disabled={!hasKanbanHorizontalOverflow}
+          className="taskboard-bottom-slider"
+          aria-label={t({ ko: '칸반 가로 스크롤', en: 'Kanban horizontal scroll', ja: 'カンバン横スクロール', zh: '看板横向滚动' })}
+        />
       </div>
 
       {/* Create modal */}
