@@ -411,9 +411,8 @@ export function ChatPanel({
         msg.receiver_id === selectedAgentId) ||
       (msg.sender_type === 'agent' &&
         msg.sender_id === selectedAgentId) ||
-      msg.message_type === 'announcement' ||
-      msg.message_type === 'directive' ||
-      msg.receiver_type === 'all'
+      (msg.receiver_type === 'agent' &&
+        msg.receiver_id === selectedAgentId)
     );
   }), [messages, selectedAgentId, selectedTaskId]);
 

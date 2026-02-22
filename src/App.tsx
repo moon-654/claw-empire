@@ -12,6 +12,9 @@ import TaskReportPopup from "./components/TaskReportPopup";
 import ReportHistory from "./components/ReportHistory";
 import AgentStatusPanel from "./components/AgentStatusPanel";
 import OfficeRoomManager from "./components/OfficeRoomManager";
+import DecisionInboxModal from "./components/DecisionInboxModal";
+import { buildDecisionInboxItems } from "./components/chat/decision-inbox";
+import type { DecisionInboxItem } from "./components/chat/decision-inbox";
 import { useWebSocket } from "./hooks/useWebSocket";
 import type {
   Department,
@@ -208,6 +211,10 @@ export default function App() {
   const [showReportHistory, setShowReportHistory] = useState(false);
   const [showAgentStatus, setShowAgentStatus] = useState(false);
   const [showRoomManager, setShowRoomManager] = useState(false);
+  const [showDecisionInbox, setShowDecisionInbox] = useState(false);
+  const [decisionInboxLoading, setDecisionInboxLoading] = useState(false);
+  const [decisionInboxItems, setDecisionInboxItems] = useState<DecisionInboxItem[]>([]);
+  const [decisionReplyBusyKey, setDecisionReplyBusyKey] = useState<string | null>(null);
   const [activeRoomThemeTargetId, setActiveRoomThemeTargetId] = useState<string | null>(null);
   const [customRoomThemes, setCustomRoomThemes] = useState<RoomThemeMap>(() => initialRoomThemes.themes);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -882,6 +889,60 @@ export default function App() {
       .catch(console.error);
   }
 
+  const loadDecisionInbox = useCallback(async () => {
+    setDecisionInboxLoading(true);
+    try {
+      const allMessages = await api.getMessages({ limit: 500 });
+      setDecisionInboxItems(buildDecisionInboxItems(allMessages, agents));
+    } catch (error) {
+      console.error("Load decision inbox failed:", error);
+    } finally {
+      setDecisionInboxLoading(false);
+    }
+  }, [agents]);
+
+  const handleOpenDecisionInbox = useCallback(() => {
+    setShowDecisionInbox(true);
+    void loadDecisionInbox();
+  }, [loadDecisionInbox]);
+
+  const handleOpenDecisionChat = useCallback((agentId: string) => {
+    const matchedAgent = agents.find((agent) => agent.id === agentId);
+    if (!matchedAgent) {
+      window.alert(pickLang(normalizeLanguage(settings.language), {
+        ko: "요청 에이전트 정보를 찾지 못했습니다.",
+        en: "Could not find the requested agent.",
+        ja: "対象エージェント情報が見つかりません。",
+        zh: "未找到对应代理信息。",
+      }));
+      return;
+    }
+    setShowDecisionInbox(false);
+    handleOpenChat(matchedAgent);
+  }, [agents, settings.language]);
+
+  const handleReplyDecisionOption = useCallback(async (item: DecisionInboxItem, optionNumber: number) => {
+    const option = item.options.find((entry) => entry.number === optionNumber);
+    if (!option) return;
+    const busyKey = `${item.id}:${option.number}`;
+    setDecisionReplyBusyKey(busyKey);
+    const locale = normalizeLanguage(settings.language);
+    const replyContent = pickLang(locale, {
+      ko: `[의사결정 회신] ${option.number}번으로 진행해 주세요. (${option.label})`,
+      en: `[Decision Reply] Please proceed with option ${option.number}. (${option.label})`,
+      ja: `[意思決定返信] ${option.number}番で進めてください。(${option.label})`,
+      zh: `[决策回复] 请按选项 ${option.number} 推进。（${option.label}）`,
+    });
+    try {
+      await handleSendMessage(replyContent, "agent", item.agentId, "chat");
+      setDecisionInboxItems((prev) => prev.filter((entry) => entry.id !== item.id));
+    } catch (error) {
+      console.error("Decision reply failed:", error);
+    } finally {
+      setDecisionReplyBusyKey((prev) => (prev === busyKey ? null : prev));
+    }
+  }, [handleSendMessage, settings.language]);
+
   const uiLanguage = normalizeLanguage(settings.language);
   const loadingTitle = pickLang(uiLanguage, {
     ko: "Claw-Empire 로딩 중...",
@@ -989,6 +1050,12 @@ export default function App() {
     en: "Agents",
     ja: "エージェント",
     zh: "代理",
+  });
+  const decisionLabel = pickLang(uiLanguage, {
+    ko: "의사결정",
+    en: "Decisions",
+    ja: "意思決定",
+    zh: "决策",
   });
   const effectiveUpdateStatus = forceUpdateBanner
     ? {
@@ -1134,6 +1201,18 @@ export default function App() {
               >
                 <span className="sm:hidden">📋</span>
                 <span className="hidden sm:inline">📋 {tasksPrimaryLabel}</span>
+              </button>
+              <button
+                onClick={handleOpenDecisionInbox}
+                disabled={decisionInboxLoading}
+                className="header-action-btn header-action-btn-secondary disabled:cursor-wait disabled:opacity-60"
+                aria-label={decisionLabel}
+              >
+                <span className="sm:hidden">{decisionInboxLoading ? "⏳" : "🧭"}</span>
+                <span className="hidden sm:inline">
+                  {decisionInboxLoading ? "⏳" : "🧭"} {decisionLabel}
+                  {decisionInboxItems.length > 0 ? ` (${decisionInboxItems.length})` : ""}
+                </span>
               </button>
               <button
                 onClick={() => setShowAgentStatus(true)}
@@ -1346,6 +1425,20 @@ export default function App() {
               }
             }}
             onClose={() => setShowChat(false)}
+          />
+        )}
+
+        {showDecisionInbox && (
+          <DecisionInboxModal
+            open={showDecisionInbox}
+            loading={decisionInboxLoading}
+            items={decisionInboxItems}
+            busyKey={decisionReplyBusyKey}
+            uiLanguage={uiLanguage}
+            onClose={() => setShowDecisionInbox(false)}
+            onRefresh={() => { void loadDecisionInbox(); }}
+            onReplyOption={handleReplyDecisionOption}
+            onOpenChat={handleOpenDecisionChat}
           />
         )}
 
