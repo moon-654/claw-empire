@@ -1,5 +1,5 @@
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
-import type { Task, Agent, Department, TaskStatus, TaskType, SubTask } from '../types';
+import type { Task, Agent, Department, TaskStatus, TaskType, SubTask, Project } from '../types';
 import AgentAvatar from './AgentAvatar';
 import AgentSelect from './AgentSelect';
 import ProjectManagerModal from './ProjectManagerModal';
@@ -10,12 +10,17 @@ interface TaskBoardProps {
   agents: Agent[];
   departments: Department[];
   subtasks: SubTask[];
+  projects: Project[];
+  selectedProjectId: string;
+  onSelectProject: (id: string) => void;
   onCreateTask: (input: {
     title: string;
     description?: string;
     department_id?: string;
     task_type?: string;
     priority?: number;
+    project_id?: string;
+    project_path?: string;
     assigned_agent_id?: string;
   }) => void;
   onUpdateTask: (id: string, data: Partial<Task>) => void;
@@ -38,6 +43,7 @@ type TFunction = (messages: Record<Locale, string>) => string;
 const LANGUAGE_STORAGE_KEY = 'climpire.language';
 const HIDDEN_TASKS_STORAGE_KEY = 'climpire.hiddenTaskIds';
 const LEGACY_HIDDEN_DONE_TASKS_STORAGE_KEY = 'climpire.hiddenDoneTaskIds';
+const PROJECT_NONE_VALUE = '__none__';
 const HIDEABLE_STATUSES = ['done', 'pending', 'cancelled'] as const;
 type HideableStatus = typeof HIDEABLE_STATUSES[number];
 const LOCALE_TAGS: Record<Locale, string> = {
@@ -276,12 +282,22 @@ function timeAgo(ts: number, localeTag: string): string {
 interface CreateModalProps {
   agents: Agent[];
   departments: Department[];
+  activeProject: Project | null;
+  selectedProjectId: string;
   onClose: () => void;
   onCreate: TaskBoardProps['onCreateTask'];
   onAssign: TaskBoardProps['onAssignTask'];
 }
 
-function CreateModal({ agents, departments, onClose, onCreate, onAssign }: CreateModalProps) {
+function CreateModal({
+  agents,
+  departments,
+  activeProject,
+  selectedProjectId,
+  onClose,
+  onCreate,
+  onAssign,
+}: CreateModalProps) {
   const { t, locale } = useI18n();
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
@@ -298,6 +314,7 @@ function CreateModal({ agents, departments, onClose, onCreate, onAssign }: Creat
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!title.trim()) return;
+    const shouldAttachProject = !!activeProject && selectedProjectId !== '' && selectedProjectId !== PROJECT_NONE_VALUE;
 
     onCreate({
       title: title.trim(),
@@ -306,6 +323,8 @@ function CreateModal({ agents, departments, onClose, onCreate, onAssign }: Creat
       task_type: taskType,
       priority,
       assigned_agent_id: assignAgentId || undefined,
+      project_id: shouldAttachProject ? activeProject.id : undefined,
+      project_path: shouldAttachProject ? activeProject.project_path : undefined,
     });
 
     onClose();
@@ -350,6 +369,27 @@ function CreateModal({ agents, departments, onClose, onCreate, onAssign }: Creat
               required
               className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white placeholder-slate-500 outline-none transition focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
             />
+          </div>
+
+          {/* Project */}
+          <div className="rounded-lg border border-slate-700/70 bg-slate-800/40 px-3 py-2 text-sm text-slate-300">
+            <p className="text-[11px] uppercase tracking-wide text-slate-500">
+              {t({ ko: '프로젝트', en: 'Project', ja: 'プロジェクト', zh: '项目' })}
+            </p>
+            {activeProject ? (
+              <div className="mt-1">
+                <p className="text-sm font-medium text-slate-200">{activeProject.name}</p>
+                <p className="text-xs text-slate-500">{activeProject.project_path}</p>
+              </div>
+            ) : selectedProjectId === PROJECT_NONE_VALUE ? (
+              <p className="mt-1 text-sm text-slate-400">
+                {t({ ko: '프로젝트 없음', en: 'No project', ja: 'プロジェクトなし', zh: '无项目' })}
+              </p>
+            ) : (
+              <p className="mt-1 text-sm text-slate-500">
+                {t({ ko: '선택된 프로젝트 없음', en: 'No project selected', ja: 'プロジェクト未選択', zh: '未选择项目' })}
+              </p>
+            )}
           </div>
 
           {/* Description */}
@@ -1086,6 +1126,8 @@ function TaskCard({
 interface FilterBarProps {
   agents: Agent[];
   departments: Department[];
+  projects: Project[];
+  selectedProjectId: string;
   filterDept: string;
   filterAgent: string;
   filterType: string;
@@ -1094,11 +1136,14 @@ interface FilterBarProps {
   onFilterAgent: (v: string) => void;
   onFilterType: (v: string) => void;
   onSearch: (v: string) => void;
+  onSelectProject: (v: string) => void;
 }
 
 function FilterBar({
   agents,
   departments,
+  projects,
+  selectedProjectId,
   filterDept,
   filterAgent,
   filterType,
@@ -1107,6 +1152,7 @@ function FilterBar({
   onFilterAgent,
   onFilterType,
   onSearch,
+  onSelectProject,
 }: FilterBarProps) {
   const { t, locale } = useI18n();
 
@@ -1134,6 +1180,21 @@ function FilterBar({
         {departments.map((d) => (
           <option key={d.id} value={d.id}>
             {d.icon} {locale === 'ko' ? d.name_ko : d.name}
+          </option>
+        ))}
+      </select>
+
+      {/* Project */}
+      <select
+        value={selectedProjectId}
+        onChange={(e) => onSelectProject(e.target.value)}
+        className="min-w-[160px] rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-sm text-slate-300 outline-none transition focus:border-blue-500"
+      >
+        <option value="">{t({ ko: '전체 프로젝트', en: 'All Projects', ja: '全プロジェクト', zh: '所有项目' })}</option>
+        <option value={PROJECT_NONE_VALUE}>{t({ ko: '프로젝트 없음', en: 'No Project', ja: 'プロジェクトなし', zh: '无项目' })}</option>
+        {projects.map((project) => (
+          <option key={project.id} value={project.id}>
+            {project.name}
           </option>
         ))}
       </select>
@@ -1298,6 +1359,9 @@ export function TaskBoard({
   agents,
   departments,
   subtasks,
+  projects,
+  selectedProjectId,
+  onSelectProject,
   onCreateTask,
   onUpdateTask,
   onDeleteTask,
@@ -1327,6 +1391,17 @@ export function TaskBoard({
   const [hiddenTaskIds, setHiddenTaskIds] = useState<Set<string>>(
     () => new Set(loadHiddenTaskIds()),
   );
+  const projectById = useMemo(() => {
+    const map = new Map<string, Project>();
+    for (const project of projects) {
+      map.set(project.id, project);
+    }
+    return map;
+  }, [projects]);
+  const activeProject =
+    selectedProjectId && selectedProjectId !== PROJECT_NONE_VALUE
+      ? projectById.get(selectedProjectId) ?? null
+      : null;
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -1398,12 +1473,20 @@ export function TaskBoard({
       if (filterDept && t.department_id !== filterDept) return false;
       if (filterAgent && t.assigned_agent_id !== filterAgent) return false;
       if (filterType && t.task_type !== filterType) return false;
+      if (selectedProjectId) {
+        if (selectedProjectId === PROJECT_NONE_VALUE) {
+          if (t.project_id) return false;
+        } else if (t.project_id !== selectedProjectId) {
+          const selectedProject = projectById.get(selectedProjectId);
+          if (!selectedProject || !t.project_path || t.project_path !== selectedProject.project_path) return false;
+        }
+      }
       if (search && !t.title.toLowerCase().includes(search.toLowerCase())) return false;
       const isHidden = hiddenTaskIds.has(t.id);
       if (!showAllTasks && isHidden) return false;
       return true;
     });
-  }, [tasks, filterDept, filterAgent, filterType, search, hiddenTaskIds, showAllTasks]);
+  }, [tasks, filterDept, filterAgent, filterType, selectedProjectId, projectById, search, hiddenTaskIds, showAllTasks]);
 
   const tasksByStatus = useMemo(() => {
     const map: Record<string, Task[]> = {};
@@ -1424,7 +1507,13 @@ export function TaskBoard({
     return map;
   }, [subtasks]);
 
-  const activeFilterCount = [filterDept, filterAgent, filterType, search].filter(Boolean).length;
+  const activeFilterCount = [
+    filterDept,
+    filterAgent,
+    filterType,
+    search,
+    selectedProjectId,
+  ].filter(Boolean).length;
   const hiddenTaskCount = useMemo(() => {
     let count = 0;
     for (const task of tasks) {
@@ -1575,6 +1664,8 @@ export function TaskBoard({
       <FilterBar
         agents={agents}
         departments={departments}
+        projects={projects}
+        selectedProjectId={selectedProjectId}
         filterDept={filterDept}
         filterAgent={filterAgent}
         filterType={filterType}
@@ -1583,6 +1674,7 @@ export function TaskBoard({
         onFilterAgent={setFilterAgent}
         onFilterType={setFilterType}
         onSearch={setSearch}
+        onSelectProject={onSelectProject}
       />
 
       {/* Kanban board */}
@@ -1671,6 +1763,8 @@ export function TaskBoard({
         <CreateModal
           agents={agents}
           departments={departments}
+          activeProject={activeProject}
+          selectedProjectId={selectedProjectId}
           onClose={() => setShowCreate(false)}
           onCreate={onCreateTask}
           onAssign={onAssignTask}

@@ -41,6 +41,9 @@ interface ChatPanelProps {
       project_context?: string;
     },
   ) => void;
+  defaultProject?: Project | null;
+  onProjectCreated?: (project: Project) => void;
+  projectCreateRequest?: number;
   onClearMessages?: (agentId?: string) => void;
   onClose: () => void;
 }
@@ -121,6 +124,9 @@ export function ChatPanel({
   onSendMessage,
   onSendAnnouncement,
   onSendDirective,
+  defaultProject,
+  onProjectCreated,
+  projectCreateRequest,
   onClearMessages,
   onClose,
 }: ChatPanelProps) {
@@ -196,8 +202,22 @@ export function ChatPanel({
   const [newProjectPath, setNewProjectPath] = useState('');
   const [newProjectGoal, setNewProjectGoal] = useState('');
   const [projectSaving, setProjectSaving] = useState(false);
+  const [projectGateError, setProjectGateError] = useState<string | null>(null);
+  const lastProjectCreateRequestRef = useRef(0);
   const [decisionReplyKey, setDecisionReplyKey] = useState<string | null>(null);
   const isDirectivePending = pendingSend?.kind === 'directive';
+  const defaultProjectMeta: ProjectMetaPayload | null = defaultProject
+    ? {
+      project_id: defaultProject.id,
+      project_path: defaultProject.project_path,
+      project_context: defaultProject.core_goal,
+    }
+    : null;
+  const isProjectCreateOnly = !pendingSend;
+
+  useEffect(() => {
+    if (defaultProjectMeta) setProjectGateError(null);
+  }, [defaultProjectMeta?.project_id]);
 
   const closeProjectFlow = () => {
     setProjectFlowOpen(false);
@@ -212,6 +232,20 @@ export function ChatPanel({
     setProjectItems([]);
   };
 
+  const openProjectCreateFlow = useCallback(() => {
+    setPendingSend(null);
+    setProjectFlowOpen(true);
+    setProjectFlowStep('new');
+    setSelectedProject(null);
+    setExistingProjectInput('');
+    setExistingProjectError('');
+    setProjectItems([]);
+    setNewProjectName('');
+    setNewProjectPath('');
+    setNewProjectGoal('');
+    setProjectGateError(null);
+  }, []);
+
   const loadRecentProjects = useCallback(async () => {
     setProjectLoading(true);
     try {
@@ -223,6 +257,13 @@ export function ChatPanel({
       setProjectLoading(false);
     }
   }, []);
+
+  useEffect(() => {
+    if (!projectCreateRequest) return;
+    if (projectCreateRequest === lastProjectCreateRequestRef.current) return;
+    lastProjectCreateRequestRef.current = projectCreateRequest;
+    openProjectCreateFlow();
+  }, [projectCreateRequest, openProjectCreateFlow]);
 
   const resolveExistingProjectSelection = useCallback((raw: string): Project | null => {
     const trimmed = raw.trim();
@@ -324,6 +365,11 @@ export function ChatPanel({
         project_path: newProjectPath.trim(),
         core_goal: goal,
       });
+      if (!pendingSend) {
+        onProjectCreated?.(created);
+        closeProjectFlow();
+        return;
+      }
       setSelectedProject(created);
       setProjectFlowStep('confirm');
     } catch (err) {
@@ -369,16 +415,26 @@ export function ChatPanel({
       action = { kind: 'broadcast', content: trimmed };
     }
 
-    const isTaskInstruction = action.kind === 'directive' || action.kind === 'task';
-    // Always ask project branch before task/directive execution.
-    const needsProjectBranch = isTaskInstruction;
-
-    if (needsProjectBranch) {
-      openProjectBranch(action);
+    const requiresProject = action.kind === 'directive' || action.kind === 'task' || action.kind === 'report';
+    if (requiresProject) {
+      if (!defaultProjectMeta) {
+        setProjectGateError(tr(
+          '상단 프로젝트를 먼저 선택해 주세요.',
+          'Please select a project from the top bar first.',
+          '上部のプロジェクトを先に選択してください。',
+          '请先从顶部选择项目。'
+        ));
+        return;
+      }
+      dispatchPending(action, defaultProjectMeta);
+      setProjectGateError(null);
+      setInput('');
+      textareaRef.current?.focus();
       return;
     }
 
     dispatchPending(action);
+    setProjectGateError(null);
     setInput('');
     textareaRef.current?.focus();
   };
@@ -1032,14 +1088,18 @@ export function ChatPanel({
                     >
                       {projectSaving
                         ? tr('등록 중...', 'Creating...', '作成中...', '创建中...')
+                        : isProjectCreateOnly
+                        ? tr('등록 후 적용', 'Create & Apply', '作成して適用', '创建并应用')
                         : tr('등록 후 선택', 'Create & Select', '作成して選択', '创建并选择')}
                     </button>
                     <button
                       type="button"
-                      onClick={() => setProjectFlowStep('choose')}
+                      onClick={() => (isProjectCreateOnly ? closeProjectFlow() : setProjectFlowStep('choose'))}
                       className="rounded border border-slate-700 px-3 py-2 text-xs text-slate-300"
                     >
-                      {tr('뒤로', 'Back', '戻る', '返回')}
+                      {isProjectCreateOnly
+                        ? tr('닫기', 'Close', '閉じる', '关闭')
+                        : tr('뒤로', 'Back', '戻る', '返回')}
                     </button>
                   </div>
                 </>
@@ -1161,6 +1221,9 @@ export function ChatPanel({
             </svg>
           </button>
         </div>
+        {projectGateError && (
+          <p className="text-xs text-rose-300 mt-1.5 px-1">{projectGateError}</p>
+        )}
         <p className="text-xs text-gray-600 mt-1.5 px-1">
           {tr('Enter로 전송, Shift+Enter로 줄바꿈', 'Press Enter to send, Shift+Enter for a new line', 'Enterで送信、Shift+Enterで改行', '按 Enter 发送，Shift+Enter 换行')}
         </p>

@@ -21,6 +21,7 @@ import type {
   Agent,
   Task,
   Message,
+  Project,
   CompanyStats,
   CompanySettings,
   CliStatusMap,
@@ -84,6 +85,8 @@ const MAX_CROSS_DEPT_DELIVERIES = 240;
 const MAX_CEO_OFFICE_CALLS = 480;
 const UPDATE_BANNER_DISMISS_STORAGE_KEY = "climpire_update_banner_dismissed";
 const ROOM_THEMES_STORAGE_KEY = "climpire_room_themes";
+const PROJECT_SELECTION_STORAGE_KEY = "climpire.selectedProjectId";
+const PROJECT_NONE_VALUE = "__none__";
 type RoomThemeMap = Record<string, RoomTheme>;
 
 function isRoomTheme(value: unknown): value is RoomTheme {
@@ -151,6 +154,14 @@ function readStoredClientLanguage(): string | null {
   return normalizeLanguage(raw);
 }
 
+function readStoredProjectSelection(projects: Project[]): string {
+  if (typeof window === "undefined") return "";
+  const raw = window.localStorage.getItem(PROJECT_SELECTION_STORAGE_KEY);
+  if (!raw) return "";
+  if (raw === PROJECT_NONE_VALUE) return raw;
+  return projects.some((project) => project.id === raw) ? raw : "";
+}
+
 function detectRuntimeOs(): RuntimeOs {
   if (typeof window === "undefined") return "unknown";
   const ua = (window.navigator.userAgent || "").toLowerCase();
@@ -187,6 +198,7 @@ export default function App() {
   const [departments, setDepartments] = useState<Department[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [stats, setStats] = useState<CompanyStats | null>(null);
   const [settings, setSettings] = useState<CompanySettings>(() =>
@@ -218,6 +230,9 @@ export default function App() {
   const [activeRoomThemeTargetId, setActiveRoomThemeTargetId] = useState<string | null>(null);
   const [customRoomThemes, setCustomRoomThemes] = useState<RoomThemeMap>(() => initialRoomThemes.themes);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [projectsLoading, setProjectsLoading] = useState(false);
+  const [selectedProjectId, setSelectedProjectId] = useState<string>("");
+  const [projectCreateRequest, setProjectCreateRequest] = useState(0);
   const [runtimeOs] = useState<RuntimeOs>(() => detectRuntimeOs());
   const [forceUpdateBanner] = useState<boolean>(() => isForceUpdateBannerEnabled());
   const [updateStatus, setUpdateStatus] = useState<api.UpdateStatus | null>(null);
@@ -267,8 +282,9 @@ export default function App() {
 
   // Initial data fetch
   const fetchAll = useCallback(async () => {
+    setProjectsLoading(true);
     try {
-      const [depts, ags, tks, sts, sett, subs, presence] = await Promise.all([
+      const [depts, ags, tks, sts, sett, subs, presence, projectList] = await Promise.all([
         api.getDepartments(),
         api.getAgents(),
         api.getTasks(),
@@ -276,11 +292,14 @@ export default function App() {
         api.getSettings(),
         api.getActiveSubtasks(),
         api.getMeetingPresence().catch(() => []),
+        api.getProjects({ page: 1, page_size: 50 }).catch(() => ({ projects: [] })),
       ]);
       setDepartments(depts);
       setAgents(ags);
       setTasks(tks);
       setStats(sts);
+      setProjects(projectList.projects);
+      setSelectedProjectId(readStoredProjectSelection(projectList.projects));
       const mergedSettings = mergeSettingsWithDefaults(sett);
       const autoDetectedLanguage = detectBrowserLanguage();
       const storedClientLanguage = readStoredClientLanguage();
@@ -331,6 +350,7 @@ export default function App() {
     } catch (e) {
       console.error("Failed to fetch data:", e);
     } finally {
+      setProjectsLoading(false);
       setLoading(false);
     }
   }, []);
@@ -367,6 +387,18 @@ export default function App() {
   useEffect(() => {
     fetchAll();
   }, [fetchAll]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(PROJECT_SELECTION_STORAGE_KEY, selectedProjectId);
+  }, [selectedProjectId]);
+
+  useEffect(() => {
+    if (!selectedProjectId || selectedProjectId === PROJECT_NONE_VALUE) return;
+    if (!projects.some((project) => project.id === selectedProjectId)) {
+      setSelectedProjectId("");
+    }
+  }, [projects, selectedProjectId]);
 
   useEffect(() => {
     return () => {
@@ -765,16 +797,31 @@ export default function App() {
     }
   }
 
+  const handleProjectCreated = useCallback((project: Project) => {
+    setProjects((prev) => [project, ...prev.filter((p) => p.id !== project.id)]);
+    setSelectedProjectId(project.id);
+  }, []);
+
   async function handleCreateTask(input: {
     title: string;
     description?: string;
     department_id?: string;
     task_type?: string;
     priority?: number;
+    project_id?: string;
+    project_path?: string;
     assigned_agent_id?: string;
   }) {
     try {
-      await api.createTask(input as Parameters<typeof api.createTask>[0]);
+      const projectForCreate =
+        selectedProjectId && selectedProjectId !== PROJECT_NONE_VALUE
+          ? projects.find((project) => project.id === selectedProjectId) ?? null
+          : null;
+      await api.createTask({
+        ...(input as Parameters<typeof api.createTask>[0]),
+        project_id: projectForCreate?.id ?? input.project_id,
+        project_path: projectForCreate?.project_path ?? input.project_path,
+      });
       const tks = await api.getTasks();
       setTasks(tks);
       const sts = await api.getStats();
@@ -944,6 +991,10 @@ export default function App() {
   }, [handleSendMessage, settings.language]);
 
   const uiLanguage = normalizeLanguage(settings.language);
+  const selectedProject = useMemo(
+    () => projects.find((project) => project.id === selectedProjectId) ?? null,
+    [projects, selectedProjectId]
+  );
   const loadingTitle = pickLang(uiLanguage, {
     ko: "Claw-Empire 로딩 중...",
     en: "Loading Claw-Empire...",
@@ -997,6 +1048,24 @@ export default function App() {
         return "";
     }
   })();
+  const projectAllLabel = pickLang(uiLanguage, {
+    ko: "전체 프로젝트",
+    en: "All projects",
+    ja: "全プロジェクト",
+    zh: "所有项目",
+  });
+  const projectNoneLabel = pickLang(uiLanguage, {
+    ko: "프로젝트 없음",
+    en: "No project",
+    ja: "プロジェクトなし",
+    zh: "无项目",
+  });
+  const projectSelectLabel = pickLang(uiLanguage, {
+    ko: "프로젝트 선택",
+    en: "Select project",
+    ja: "プロジェクト選択",
+    zh: "选择项目",
+  });
   const announcementLabel = `📢 ${pickLang(uiLanguage, {
     ko: "전사 공지",
     en: "Announcement",
@@ -1192,6 +1261,46 @@ export default function App() {
                 ☰
               </button>
               <h1 className="truncate text-base font-bold sm:text-lg" style={{ color: 'var(--th-text-heading)' }}>{viewTitle}</h1>
+              <div className="flex items-center gap-2">
+                <select
+                  value={selectedProjectId}
+                  onChange={(e) => setSelectedProjectId(e.target.value)}
+                  disabled={projectsLoading}
+                  className="max-w-[240px] rounded-lg border border-slate-700 bg-slate-900/60 px-2.5 py-1.5 text-xs text-slate-200 outline-none transition focus:border-blue-500 disabled:opacity-60"
+                  aria-label={projectSelectLabel}
+                  title={projectSelectLabel}
+                >
+                  <option value="">{projectAllLabel}</option>
+                  <option value={PROJECT_NONE_VALUE}>{projectNoneLabel}</option>
+                  {projects.map((project) => (
+                    <option key={project.id} value={project.id}>
+                      {project.name} · {project.project_path}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  onClick={() => {
+                    setProjectCreateRequest((prev) => prev + 1);
+                    setChatAgent(null);
+                    setShowChat(true);
+                  }}
+                  className="inline-flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg border border-slate-700 bg-slate-900/60 text-sm text-slate-200 transition hover:bg-slate-800"
+                  aria-label={pickLang(uiLanguage, {
+                    ko: "프로젝트 추가",
+                    en: "Add project",
+                    ja: "プロジェクト追加",
+                    zh: "新增项目",
+                  })}
+                  title={pickLang(uiLanguage, {
+                    ko: "프로젝트 추가",
+                    en: "Add project",
+                    ja: "プロジェクト追加",
+                    zh: "新增项目",
+                  })}
+                >
+                  +
+                </button>
+              </div>
             </div>
             <div className="flex items-center gap-2 sm:gap-3">
               <button
@@ -1376,6 +1485,9 @@ export default function App() {
                 agents={agents}
                 departments={departments}
                 subtasks={subtasks}
+                projects={projects}
+                selectedProjectId={selectedProjectId}
+                onSelectProject={setSelectedProjectId}
                 onCreateTask={handleCreateTask}
                 onUpdateTask={handleUpdateTask}
                 onDeleteTask={handleDeleteTask}
@@ -1386,6 +1498,7 @@ export default function App() {
                 onResumeTask={handleResumeTask}
                 onOpenTerminal={(id) => setTaskPanel({ taskId: id, tab: "terminal" })}
                 onOpenMeetingMinutes={(id) => setTaskPanel({ taskId: id, tab: "minutes" })}
+                onOpenAgentChat={(agent) => handleOpenChat(agent)}
               />
             )}
 
@@ -1416,6 +1529,9 @@ export default function App() {
             onSendMessage={handleSendMessage}
             onSendAnnouncement={handleSendAnnouncement}
             onSendDirective={handleSendDirective}
+            defaultProject={selectedProjectId && selectedProjectId !== PROJECT_NONE_VALUE ? selectedProject : null}
+            onProjectCreated={handleProjectCreated}
+            projectCreateRequest={projectCreateRequest}
             onClearMessages={async (agentId) => {
               try {
                 await api.clearMessages(agentId);
